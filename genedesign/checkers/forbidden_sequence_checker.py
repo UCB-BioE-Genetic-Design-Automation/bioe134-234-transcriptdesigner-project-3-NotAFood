@@ -1,5 +1,6 @@
 from genedesign.seq_utils.reverse_complement import reverse_complement
 
+
 class ForbiddenSequenceChecker:
     def __init__(self):
         self.forbidden = []
@@ -12,19 +13,19 @@ class ForbiddenSequenceChecker:
             "CCCCCCCC",  # poly(C)
             "GGGGGGGG",  # poly(G)
             "ATATATAT",  # poly(AT)
-            "CAATTG",    # MfeI
-            "GAATTC",    # EcoRI
-            "GGATCC",    # BamHI
-            "AGATCT",    # BglII
-            "ACTAGT",    # SpeI
-            "TCTAGA",    # XbaI
-            "GGTCTC",    # BsaI
-            "CGTCTC",    # BsmBI
-            "CACCTGC",   # AarI
-            "CTGCAG",    # PstI
-            "CTCGAG",    # XhoI
+            "CAATTG",  # MfeI
+            "GAATTC",  # EcoRI
+            "GGATCC",  # BamHI
+            "AGATCT",  # BglII
+            "ACTAGT",  # SpeI
+            "TCTAGA",  # XbaI
+            "GGTCTC",  # BsaI
+            "CGTCTC",  # BsmBI
+            "CACCTGC",  # AarI
+            "CTGCAG",  # PstI
+            "CTCGAG",  # XhoI
             "GCGGCCGC",  # NotI
-            "AAGCTT",    # HindIII
+            "AAGCTT",  # HindIII
         ]
 
     def run(self, dnaseq):
@@ -38,11 +39,13 @@ class ForbiddenSequenceChecker:
 
         return True, None
 
+
 def main():
     checker = ForbiddenSequenceChecker()
     checker.initiate()
     result = checker.run("GGGGGGGGG")  # returns False due to poly(G)
     print(result)
+
 
 if __name__ == "__main__":
     main()
