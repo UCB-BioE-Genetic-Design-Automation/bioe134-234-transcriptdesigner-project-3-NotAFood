@@ -1,12 +1,10 @@
-import random
-from pathlib import Path
-
 from genedesign.checkers.codon_checker import CodonChecker
 from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
 from genedesign.checkers.hairpin_checker import hairpin_checker
 from genedesign.checkers.internal_promoter_checker import PromoterChecker
 from genedesign.models.transcript import Transcript
 from genedesign.rbs_chooser import RBSChooser
+from genedesign.seq_utils.codon_usage import CodonUsage
 
 MAX_ATTEMPTS = 1000
 
@@ -17,7 +15,7 @@ class TranscriptDesigner:
     """
 
     def __init__(self):
-        self.aminoAcidToCodons = {}  # Maps amino acid to list of (codon, weight) tuples
+        self.codonUsage = CodonUsage()
         self.rbsChooser = None
         self.promoterChecker = PromoterChecker()
         self.promoterChecker.initiate()
@@ -28,27 +26,11 @@ class TranscriptDesigner:
 
     def initiate(self) -> None:
         """
-        Initializes the codon table and the RBS chooser.
+        Initializes the codon usage table and the RBS chooser.
         """
         self.rbsChooser = RBSChooser()
         self.rbsChooser.initiate()
-
-        # Load codon usage data for weighted random selection
-        self.aminoAcidToCodons = {}
-        codon_usage_path = Path(__file__).parent / "data" / "codon_usage.txt"
-
-        with open(codon_usage_path, "r") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 3:
-                    codon = parts[0]
-                    amino_acid = parts[1]
-                    weight = float(parts[2])
-
-                    if amino_acid not in self.aminoAcidToCodons:
-                        self.aminoAcidToCodons[amino_acid] = []
-
-                    self.aminoAcidToCodons[amino_acid].append((codon, weight))
+        self.codonUsage.initiate()
 
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
@@ -88,7 +70,7 @@ class TranscriptDesigner:
             end_idx = min(start_idx + window_size, len(peptide))
 
             for i in range(start_idx, end_idx):
-                codons[i] = self._weighted_random_codon(peptide[i])
+                codons[i] = self.codonUsage.weighted_random_codon(peptide[i])
 
         raise RuntimeError(
             "Could not generate a valid DNA sequence after maximum attempts."
@@ -96,7 +78,7 @@ class TranscriptDesigner:
 
     def _generate_best_cai_sequence(self, peptide: str) -> list:
         """
-        Generates a list of codons for the given peptide sequence using best (highest CAI) codon for each amino acid.
+        Generates a list of codons for the given peptide sequence using the best (highest CAI) codon for each amino acid.
         This provides an optimized starting point for the sliding window refinement.
 
         Parameters:
@@ -104,40 +86,7 @@ class TranscriptDesigner:
         Returns:
             list: A list of codons corresponding to the peptide sequence.
         """
-        codons = []
-        for amino_acid in peptide:
-            if amino_acid in self.aminoAcidToCodons:
-                # Select the codon with the highest weight (CAI)
-                best_codon = max(
-                    self.aminoAcidToCodons[amino_acid], key=lambda x: x[1]
-                )[0]
-                codons.append(best_codon)
-            else:
-                # Fallback for unknown amino acids
-                codons.append("ATG")
-        return codons
-
-    def _weighted_random_codon(self, amino_acid: str) -> str:
-        """
-        Returns a randomly selected codon for the given amino acid, weighted by codon usage frequency.
-
-        Parameters:
-            amino_acid (str): The amino acid to translate.
-
-        Returns:
-            str: The corresponding codon, selected based on weighted probabilities.
-        """
-        if amino_acid not in self.aminoAcidToCodons:
-            # Fallback to ATG if amino acid not found
-            return "ATG"
-
-        codons_with_weights = self.aminoAcidToCodons[amino_acid]
-        codons = [codon for codon, _ in codons_with_weights]
-        weights = [weight for _, weight in codons_with_weights]
-
-        # Use random.choices to select a codon based on weights
-        selected_codon = random.choices(codons, weights=weights, k=1)[0]
-        return selected_codon
+        return [self.codonUsage.best_cai_codon(aa) for aa in peptide]
 
     def _all_checkers_pass(self, sequence: str) -> bool:
         """
