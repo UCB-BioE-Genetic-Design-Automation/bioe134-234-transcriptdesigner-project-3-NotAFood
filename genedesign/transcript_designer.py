@@ -53,6 +53,8 @@ class TranscriptDesigner:
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
         Translates the peptide sequence to DNA and selects an RBS.
+        Uses a sliding window approach: starts with highest-CAI codons, then selectively
+        randomizes 3-codon windows until all validation checks pass.
 
         Parameters:
             peptide (str): The protein sequence to translate.
@@ -60,36 +62,42 @@ class TranscriptDesigner:
 
         Returns:
             Transcript: The transcript object with the selected RBS and translated codons.
-        """
 
-        dna_sequence_candidate = ""
+        Raises:
+            RuntimeError: If no valid sequence can be generated after MAX_ATTEMPTS attempts.
+        """
+        # Generate initial sequence using best CAI codons
+        codons = self._generate_best_cai_sequence(peptide)
+
+        # Window-based refinement: validate and randomize windows as needed
+        window_size = 3
+        num_windows = (len(peptide) + window_size - 1) // window_size
+
         for attempt in range(MAX_ATTEMPTS):
-            codons = self._generate_weighted_random_sequence_of_codons(peptide)
+            dna_sequence = "".join(codons)
+            if self._all_checkers_pass(dna_sequence):
+                # Found valid sequence
+                codons.append("TAA")
+                cds = "".join(codons)
+                selectedRBS = self.rbsChooser.run(cds, ignores)
+                return Transcript(selectedRBS, peptide, codons)
 
-            dna_sequence_candidate = "".join(codons)
-            if self._all_checkers_pass(dna_sequence_candidate):
-                break  # Valid sequence found, exit the loop
-        else:
-            # fallback if no valid solution found
-            raise RuntimeError(
-                "Could not generate a valid DNA sequence after maximum attempts."
-            )
+            # Randomize a window in a cycling pattern to try different regions
+            window_idx = attempt % num_windows
+            start_idx = window_idx * window_size
+            end_idx = min(start_idx + window_size, len(peptide))
 
-        # Append the stop codon (TAA in this case)
-        codons.append("TAA")
+            for i in range(start_idx, end_idx):
+                codons[i] = self._weighted_random_codon(peptide[i])
 
-        # Build the CDS from the codons
-        cds = "".join(codons)
+        raise RuntimeError(
+            "Could not generate a valid DNA sequence after maximum attempts."
+        )
 
-        # Choose an RBS
-        selectedRBS = self.rbsChooser.run(cds, ignores)
-
-        # Return the Transcript object
-        return Transcript(selectedRBS, peptide, codons)
-
-    def _generate_weighted_random_sequence_of_codons(self, peptide: str) -> list:
+    def _generate_best_cai_sequence(self, peptide: str) -> list:
         """
-        Generates a list of codons for the given peptide sequence using weighted random selection.
+        Generates a list of codons for the given peptide sequence using best (highest CAI) codon for each amino acid.
+        This provides an optimized starting point for the sliding window refinement.
 
         Parameters:
             peptide (str): The protein sequence to translate.
@@ -98,8 +106,15 @@ class TranscriptDesigner:
         """
         codons = []
         for amino_acid in peptide:
-            codon = self._weighted_random_codon(amino_acid)
-            codons.append(codon)
+            if amino_acid in self.aminoAcidToCodons:
+                # Select the codon with the highest weight (CAI)
+                best_codon = max(
+                    self.aminoAcidToCodons[amino_acid], key=lambda x: x[1]
+                )[0]
+                codons.append(best_codon)
+            else:
+                # Fallback for unknown amino acids
+                codons.append("ATG")
         return codons
 
     def _weighted_random_codon(self, amino_acid: str) -> str:
@@ -113,8 +128,8 @@ class TranscriptDesigner:
             str: The corresponding codon, selected based on weighted probabilities.
         """
         if amino_acid not in self.aminoAcidToCodons:
-            # Fallback to highest CAI codon if amino acid not found
-            return self.aminoAcidToCodon.get(amino_acid, "ATG")
+            # Fallback to ATG if amino acid not found
+            return "ATG"
 
         codons_with_weights = self.aminoAcidToCodons[amino_acid]
         codons = [codon for codon, _ in codons_with_weights]
@@ -143,13 +158,18 @@ class TranscriptDesigner:
 
 if __name__ == "__main__":
     # Example usage of TranscriptDesigner
+    import time
+
     peptide = "MYPFIRTARMTV"
 
     designer = TranscriptDesigner()
     designer.initiate()
 
     ignores = set()
+    start_time = time.time()
     transcript = designer.run(peptide, ignores)
+    elapsed_time = time.time() - start_time
 
     # Print out the transcript information
     print(transcript)
+    print(f"\nCompleted in {elapsed_time:.2f} seconds")
