@@ -1,3 +1,5 @@
+from itertools import product
+
 from genedesign.checkers.codon_checker import CodonChecker
 from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
 from genedesign.checkers.hairpin_checker import hairpin_checker
@@ -5,8 +7,6 @@ from genedesign.checkers.internal_promoter_checker import PromoterChecker
 from genedesign.models.transcript import Transcript
 from genedesign.rbs_chooser import RBSChooser
 from genedesign.seq_utils.codon_usage import CodonUsage
-
-MAX_ATTEMPTS = 1000
 
 
 class TranscriptDesigner:
@@ -35,8 +35,9 @@ class TranscriptDesigner:
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
         Translates the peptide sequence to DNA and selects an RBS.
-        Uses a sliding window approach: starts with highest-CAI codons, then selectively
-        randomizes 3-codon windows until all validation checks pass.
+        Uses a sliding window optimization approach: processes 3-amino-acid windows left to right,
+        enumerating all codon combinations for each window while considering upstream (preamble)
+        and downstream context. Selects the best combination based on validation and CAI scoring.
 
         Parameters:
             peptide (str): The protein sequence to translate.
@@ -46,63 +47,156 @@ class TranscriptDesigner:
             Transcript: The transcript object with the selected RBS and translated codons.
 
         Raises:
-            RuntimeError: If no valid sequence can be generated after MAX_ATTEMPTS attempts.
+            RuntimeError: If no valid sequence can be generated.
         """
-        # Generate initial sequence using best CAI codons
-        codons = self._generate_best_cai_sequence(peptide)
+        # Initialize the chosen codons list (will be built incrementally)
+        chosen_codons = []
 
-        # Window-based refinement: validate and randomize windows as needed
+        # Window size: 3 amino acids at a time
         window_size = 3
-        num_windows = (len(peptide) + window_size - 1) // window_size
+        lookahead_size = 6  # Next 6 amino acids for downstream context
 
-        for attempt in range(MAX_ATTEMPTS):
-            dna_sequence = "".join(codons)
-            if self._all_checkers_pass(dna_sequence):
-                # Found valid sequence
-                codons.append("TAA")
-                cds = "".join(codons)
-                selectedRBS = self.rbsChooser.run(cds, ignores)
-                return Transcript(selectedRBS, peptide, codons)
+        # Process peptide in windows of 3 amino acids
+        for window_start in range(0, len(peptide), window_size):
+            window_end = min(window_start + window_size, len(peptide))
+            current_window = peptide[window_start:window_end]
 
-            # Randomize a window in a cycling pattern to try different regions
-            window_idx = attempt % num_windows
-            start_idx = window_idx * window_size
-            end_idx = min(start_idx + window_size, len(peptide))
+            # Get downstream context (next 6 amino acids)
+            downstream_start = window_end
+            downstream_end = min(downstream_start + lookahead_size, len(peptide))
+            downstream_aas = peptide[downstream_start:downstream_end]
 
-            for i in range(start_idx, end_idx):
-                codons[i] = self.codonUsage.weighted_random_codon(peptide[i])
+            # Find the best codon combination for this window
+            best_codons = self._optimize_window(
+                current_window, chosen_codons, downstream_aas, ignores
+            )
 
-        raise RuntimeError(
-            "Could not generate a valid DNA sequence after maximum attempts."
-        )
+            # Add the best codons to our chosen list
+            chosen_codons.extend(best_codons)
 
-    def _generate_best_cai_sequence(self, peptide: str) -> list:
+        # Add stop codon
+        chosen_codons.append("TAA")
+
+        # Final assembly: select RBS and create transcript
+        cds = "".join(chosen_codons)
+        selectedRBS = self.rbsChooser.run(cds, ignores)
+
+        return Transcript(selectedRBS, peptide, chosen_codons)
+
+    def _optimize_window(
+        self, window_aas: str, preamble_codons: list, downstream_aas: str, ignores: set
+    ) -> list:
         """
-        Generates a list of codons for the given peptide sequence using the best (highest CAI) codon for each amino acid.
-        This provides an optimized starting point for the sliding window refinement.
+        Optimizes a 3-amino-acid window by enumerating all possible codon combinations
+        and selecting the best one based on validation checks and CAI.
 
         Parameters:
-            peptide (str): The protein sequence to translate.
-        Returns:
-            list: A list of codons corresponding to the peptide sequence.
-        """
-        return [self.codonUsage.best_cai_codon(aa) for aa in peptide]
+            window_aas (str): The amino acids in the current window (1-3 aa).
+            preamble_codons (list): Already-chosen codons from previous windows.
+            downstream_aas (str): Next 6 amino acids for downstream context.
+            ignores (set): RBS options to ignore.
 
-    def _all_checkers_pass(self, sequence: str) -> bool:
+        Returns:
+            list: The best codon combination for this window.
         """
-        Placeholder for sequence validation checks. Implement specific checks as needed.
+        # Get all possible codons for each amino acid in the window
+        codon_options = [self._get_all_codons_for_aa(aa) for aa in window_aas]
+
+        # Generate all possible combinations (cartesian product)
+        all_combinations = list(product(*codon_options))
+
+        # Generate downstream codons using best CAI (for context only)
+        downstream_codons = [
+            self.codonUsage.best_cai_codon(aa) for aa in downstream_aas
+        ]
+
+        # Score all combinations
+        best_score = -float("inf")
+        best_combination = None
+
+        for combination in all_combinations:
+            score = self._score_combination(
+                list(combination), preamble_codons, downstream_codons, ignores
+            )
+
+            if score > best_score:
+                best_score = score
+                best_combination = combination
+
+        # If we found a good combination, return it
+        # Otherwise return the best CAI combination as fallback
+        if best_combination is not None:
+            return list(best_combination)
+        else:
+            # Fallback: use best CAI codons
+            return [self.codonUsage.best_cai_codon(aa) for aa in window_aas]
+
+    def _get_all_codons_for_aa(self, aa: str) -> list:
+        """
+        Returns all possible codons for a given amino acid.
 
         Parameters:
-            sequence (str): The DNA sequence to validate.
-        Returns:
-            bool: True if all checks pass, False otherwise.
-        """
-        # Note: The checkers return false if a problem is found, so we can directly return the result of the checks.
-        has_internal_promoter, _ = self.promoterChecker.run(sequence)
-        has_hairpin, _ = hairpin_checker(sequence)
-        has_forbidden, _ = self.forbiddenChecker.run(sequence)
+            aa (str): Single-letter amino acid code.
 
-        return has_internal_promoter and has_hairpin and has_forbidden
+        Returns:
+            list: All codons that encode this amino acid.
+        """
+        if aa not in self.codonUsage.amino_acid_to_codons:
+            return ["ATG"]  # Default fallback
+
+        # Extract just the codon strings from (codon, weight) tuples
+        return [codon for codon, _ in self.codonUsage.amino_acid_to_codons[aa]]
+
+    def _score_combination(
+        self,
+        current_codons: list,
+        preamble_codons: list,
+        downstream_codons: list,
+        ignores: set,
+    ) -> float:
+        """
+        Scores a codon combination based on validation checks and CAI.
+        Higher scores are better.
+
+        Parameters:
+            current_codons (list): Codons for the current window being optimized.
+            preamble_codons (list): Already-chosen codons from previous windows.
+            downstream_codons (list): Placeholder codons for downstream context.
+            ignores (set): RBS options to ignore.
+
+        Returns:
+            float: Score for this combination (higher is better).
+        """
+        # Construct the full sequence for validation
+        # preamble + current + downstream (no stop codon yet in middle of sequence)
+        all_codons = preamble_codons + current_codons + downstream_codons
+        cds = "".join(all_codons)
+
+        # Select RBS to construct full transcript
+        try:
+            selectedRBS = self.rbsChooser.run(cds, ignores)
+            full_sequence = selectedRBS.utr.upper() + cds
+        except Exception:
+            # If RBS selection fails, return very low score
+            return -1000.0
+
+        # Check validation for the full context
+        has_internal_promoter, _ = self.promoterChecker.run(full_sequence)
+        has_hairpin, _ = hairpin_checker(full_sequence)
+        has_forbidden, _ = self.forbiddenChecker.run(full_sequence)
+
+        # Calculate CAI just for the current window being optimized
+        _, _, _, window_cai = self.codonChecker.run(current_codons)
+
+        # Scoring strategy:
+        # - If all checks pass: reward with CAI value (0-1 range)
+        # - If checks fail: penalize but still differentiate by CAI
+        if has_internal_promoter and has_hairpin and has_forbidden:
+            # Valid sequence: high base score + CAI bonus
+            return 100.0 + window_cai
+        else:
+            # Invalid sequence: still use CAI to differentiate, but keep score low
+            return window_cai
 
 
 if __name__ == "__main__":

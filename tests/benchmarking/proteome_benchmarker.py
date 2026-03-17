@@ -2,7 +2,6 @@ import csv
 import os
 import time
 import traceback
-from datetime import datetime
 from statistics import mean
 
 from genedesign.checkers.codon_checker import CodonChecker
@@ -11,22 +10,6 @@ from genedesign.checkers.hairpin_checker import hairpin_checker
 from genedesign.checkers.internal_promoter_checker import PromoterChecker
 from genedesign.seq_utils.translate import Translate
 from genedesign.transcript_designer import TranscriptDesigner
-
-
-def create_run_directory():
-    """
-    Creates a timestamped directory for storing benchmark run outputs.
-    Returns the path to the created directory.
-    """
-    runs_base = "runs"
-    if not os.path.exists(runs_base):
-        os.makedirs(runs_base)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = os.path.join(runs_base, timestamp)
-    os.makedirs(run_dir, exist_ok=True)
-
-    return run_dir
 
 
 def parse_fasta(fasta_file):
@@ -92,13 +75,12 @@ def benchmark_proteome(fasta_file):
     return successful_results, error_results
 
 
-def analyze_errors(error_results, output_dir):
+def analyze_errors(error_results):
     """
     Write the error analysis to a text file.
     """
     error_summary = {}
-    error_file = os.path.join(output_dir, "error_summary.txt")
-    with open(error_file, "w") as f:
+    with open("error_summary.txt", "w") as f:
         for error in error_results:
             error_message = error["error"].split("\n")[0]
             error_summary[error_message] = error_summary.get(error_message, 0) + 1
@@ -209,12 +191,11 @@ def validate_transcripts(successful_results):
     return validation_failures
 
 
-def write_validation_report(validation_failures, output_dir):
+def write_validation_report(validation_failures):
     """
     Writes validation results to a TSV file.
     """
-    validation_file = os.path.join(output_dir, "validation_failures.tsv")
-    with open(validation_file, "w", newline="") as f:
+    with open("validation_failures.tsv", "w", newline="") as f:
         writer = csv.writer(f, delimiter="\t")
         writer.writerow(["gene", "protein", "cds", "site"])
         for failure in validation_failures:
@@ -224,12 +205,7 @@ def write_validation_report(validation_failures, output_dir):
 
 
 def generate_summary(
-    total_genes,
-    parsing_time,
-    execution_time,
-    errors_summary,
-    validation_failures,
-    output_dir,
+    total_genes, parsing_time, execution_time, errors_summary, validation_failures
 ):
     """
     Generates a streamlined summary report categorizing validation failures by checker.
@@ -260,8 +236,7 @@ def generate_summary(
             checker_failures["Translation/Completeness Checker"] += 1
 
     # Generate the summary report
-    summary_file = os.path.join(output_dir, "summary_report.txt")
-    with open(summary_file, "w") as f:
+    with open("summary_report.txt", "w") as f:
         f.write(f"Total genes processed: {total_genes}\n")
         f.write(f"Parsing runtime: {parsing_time:.2f} seconds\n")
         f.write(f"Execution runtime: {execution_time:.2f} seconds\n")
@@ -288,10 +263,6 @@ def run_benchmark(fasta_file):
     """
     Runs the complete benchmark process: parsing, running TranscriptDesigner, validating, and generating reports.
     """
-    # Create timestamped output directory
-    output_dir = create_run_directory()
-    print(f"Output directory: {output_dir}")
-
     start_time = time.time()
 
     # Benchmark the proteome
@@ -300,7 +271,7 @@ def run_benchmark(fasta_file):
     parsing_time = time.time() - parsing_start
 
     # Analyze and log errors
-    errors_summary = analyze_errors(error_results, output_dir)
+    errors_summary = analyze_errors(error_results)
 
     # Validate the successful transcripts
     validation_start = time.time()
@@ -308,17 +279,12 @@ def run_benchmark(fasta_file):
     execution_time = time.time() - validation_start
 
     # Write validation and error reports
-    write_validation_report(validation_failures, output_dir)
+    write_validation_report(validation_failures)
 
     # Generate the summary report
     total_genes = len(successful_results) + len(error_results)
     generate_summary(
-        total_genes,
-        parsing_time,
-        execution_time,
-        errors_summary,
-        validation_failures,
-        output_dir,
+        total_genes, parsing_time, execution_time, errors_summary, validation_failures
     )
 
 
