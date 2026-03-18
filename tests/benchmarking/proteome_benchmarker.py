@@ -58,6 +58,7 @@ def benchmark_proteome(fasta_file):
         print(f"Processing gene: {gene} with protein sequence: {protein[:30]}...")
         ignores = set()
         transcript = designer.run(protein, ignores)
+        print(f"  SUCCESS: {gene} (len={len(protein)})")
         successful_results.append(
             {"gene": gene, "protein": protein, "transcript": transcript}
         )

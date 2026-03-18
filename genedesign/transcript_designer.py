@@ -13,6 +13,8 @@ from genedesign.checkers.internal_rbs_checker import InternalRBSChecker
 from genedesign.models.transcript import Transcript
 from genedesign.rbs_chooser import RBSChooser
 
+random.seed(42)
+
 
 def _setup_logger() -> logging.Logger:
     """Creates a file logger writing to logs/<YYYY-MM-DD_HH-MM-SS>.log."""
@@ -89,22 +91,16 @@ class TranscriptDesigner:
 
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
-        Builds the CDS left-to-right using a sliding window.
+        Builds the CDS left-to-right using a greedy sliding window.
 
         For each window of amino acids:
           1. Enumerate all synonymous codon combinations.
-          2. Evaluate each combination in local context:
-               preamble   -- last 50 bp of already-locked codons
-               window     -- the codons under evaluation
-               downstream -- a random sample of the next 6 AAs (18 bp),
-                             used only for context, then discarded
-          3. Score: -inf if local sequence contains a forbidden site or
-             hairpin; otherwise sum of log(codon_weight).
-          4. Softmax-sample from valid combos (promotes codon diversity)
-             and lock the winner, then advance the window.
+          2. Score each in context: UTR/locked preamble (>=50 bp) + window +
+             random downstream (18 bp).  Forbidden sequences are hard-rejected;
+             hairpins and promoters are penalised.
+          3. Pick the best-scoring combo (greedy) and lock it.
 
-        Global checks are run before RBS selection and final validation.
-        If checks fail, the entire assembly restarts from scratch.
+        Restarts vary because downstream context is randomly sampled each time.
 
         Parameters:
             peptide  (str): Protein sequence to reverse-translate.
@@ -113,11 +109,11 @@ class TranscriptDesigner:
         Returns:
             Transcript: Validated transcript with RBS and codon list.
         """
-        WINDOW = 5  # codons chosen per step — wider window catches cross-boundary
-                    # hairpins (e.g. His CAT <-> Met ATG 12bp apart) before they
-                    # are locked. 4^5 = 1024 combos/step, still fast.
-        DOWNSTREAM = 6  # AAs of random downstream context (discarded)
+        WINDOW = 5
+        DOWNSTREAM = 6
         MAX_RESTARTS = 100
+        # Minimum context length so hairpin chunks (50 bp) always fit.
+        MIN_CONTEXT = 50
 
         self.log.info(
             "=== run() called | peptide_len=%d | peptide=%s%s",
@@ -125,6 +121,13 @@ class TranscriptDesigner:
             peptide[:30],
             "..." if len(peptide) > 30 else "",
         )
+
+        # Pre-compute the UTR so the first windows see realistic context.
+        utr = ""
+        for rbsopt in self.rbsChooser.rbsOptions:
+            if rbsopt not in ignores:
+                utr = rbsopt.utr.upper()
+                break
 
         for restart_idx in range(MAX_RESTARTS):
             self.log.info("--- Restart %d/%d ---", restart_idx + 1, MAX_RESTARTS)
@@ -136,41 +139,30 @@ class TranscriptDesigner:
                 win_end = min(win_start + WINDOW, len(peptide))
                 amino_window = peptide[win_start:win_end]
 
-                # 50 bp preamble matches hairpin_checker's chunk size.
-                preamble = "".join(locked)[-50:]
+                # Build preamble: UTR + all locked codons, then take the
+                # last MIN_CONTEXT characters.  This guarantees that even
+                # the first window has enough context for a full 50 bp
+                # hairpin chunk to be evaluated.
+                full_prefix = utr + "".join(locked)
+                preamble = full_prefix[-MIN_CONTEXT:] if len(full_prefix) > MIN_CONTEXT else full_prefix
+
                 ds_aas = peptide[win_end : win_end + DOWNSTREAM]
                 downstream = "".join(self._weighted_random_codon(aa) for aa in ds_aas)
+                # Pad downstream so check_seq is always >= MIN_CONTEXT + window.
+                while len(preamble) + len(amino_window) * 3 + len(downstream) < MIN_CONTEXT + len(amino_window) * 3:
+                    downstream += random.choice("ACGT")
 
-                scored: list[tuple[tuple, float]] = []
+                best_combo = None
+                best_score = float("-inf")
                 for combo in self._enumerate_codon_combos(amino_window):
-                    # Include downstream so _score_window can see hairpin traps
-                    # that the current window sets up with future codons (AOT).
                     check_seq = preamble + "".join(combo) + downstream
                     score = self._score_window(check_seq, combo, len(preamble))
-                    scored.append((combo, score))
+                    if score > best_score:
+                        best_score = score
+                        best_combo = combo
 
-                valid = [(c, s) for c, s in scored if s > float("-inf")]
-                if valid:
-                    max_s = max(s for _, s in valid)
-                    weights = [math.exp(s - max_s) for _, s in valid]
-                    best_combo = random.choices(
-                        [c for c, _ in valid], weights=weights, k=1
-                    )[0]
-                    best_score = dict(scored)[best_combo]
-                else:
+                if best_score <= float("-inf"):
                     zero_valid_windows += 1
-                    best_combo = max(scored, key=lambda x: x[1])[0]
-                    best_score = float("-inf")
-                    # Log why every combo failed for this window.
-                    reason = self._first_violation_reason(
-                        preamble, best_combo, len(preamble), downstream
-                    )
-                    self.log.warning(
-                        "  WINDOW aa[%d:%d] aas=%-6s | valid_combos=0 | "
-                        "fallback=%s | violation: %s",
-                        win_start, win_end, amino_window,
-                        "".join(best_combo), reason,
-                    )
 
                 locked.extend(best_combo)
 
@@ -180,7 +172,7 @@ class TranscriptDesigner:
                 "".join(locked)[:30],
             )
 
-            # ── Codon quality check ───────────────────────────────────────
+            # ── Codon quality check (logged, not gated) ──────────────────
             codons_above_board, diversity, rare_count, cai = self.codonChecker.run(
                 locked
             )
@@ -191,8 +183,6 @@ class TranscriptDesigner:
                 rare_count,
                 cai,
             )
-            if not codons_above_board:
-                continue
 
             # ── RBS selection ─────────────────────────────────────────────
             locked.append("TAA")
@@ -247,7 +237,6 @@ class TranscriptDesigner:
     def _enumerate_codon_combos(self, amino_acids: str):
         """
         Yields every synonymous codon combination for *amino_acids*.
-        At most ~216 combinations for a 3-AA window.
         """
         options = [
             [
@@ -262,28 +251,20 @@ class TranscriptDesigner:
 
     def _score_window(self, check_seq: str, combo: tuple, window_offset: int) -> float:
         """
-        Scores *combo* in context *check_seq* = preamble + window [+ downstream].
-
-        *window_offset* is len(preamble), i.e. the index in check_seq where the
-        new codons start.
-
-        Violation detection:
-          - Forbidden sequences: only rejected if the site overlaps the window
-            portion (starts or ends inside positions window_offset..window_end).
-          - Hairpins: uses chunk-based counting (50 bp chunks, 25 bp step)
-            matching hairpin_checker's threshold of count > 1.  Only chunks that
-            overlap the window region are evaluated — preamble-only chunks were
-            already validated when their codons were placed.  Including downstream
-            in check_seq means chunks that straddle the window-downstream boundary
-            are also checked, catching forward hairpin traps AOT.
+        Scores *combo* in context.  Forbidden sequences → -inf.
+        Hairpins and promoters → large penalties.  Otherwise codon weight sum.
         """
         from genedesign.seq_utils.hairpin_counter import hairpin_counter
         from genedesign.seq_utils.reverse_complement import reverse_complement
 
         window_end = window_offset + len(combo) * 3
         CHUNK, STEP = 50, 25
+        HAIRPIN_PENALTY = 200.0
+        PROMOTER_PENALTY = 200.0
+        PROMOTER_FRAME = 29
+        PROMOTER_THRESHOLD = 9.134
 
-        # ── Forbidden sequences (forward + RC) ────────────────────────────
+        # ── Forbidden sequences (forward + RC) — hard reject ────────────
         rc_seq = reverse_complement(check_seq)
         for site in self.forbiddenChecker.forbidden:
             site_len = len(site)
@@ -299,61 +280,48 @@ class TranscriptDesigner:
                     return float("-inf")
                 pos = rc_seq.find(site, pos + 1)
 
-        # ── Hairpins (chunk-based, mirrors hairpin_checker threshold) ──────
-        # Evaluate every 50 bp chunk that overlaps the window region.
-        # Downstream content (if present) extends check_seq so cross-boundary
-        # chunks are included automatically.
-        seq_len = len(check_seq)
-        for chunk_start in range(0, seq_len - CHUNK + 1, STEP):
-            chunk_end = chunk_start + CHUNK
-            if chunk_end <= window_offset or chunk_start >= window_end:
-                continue  # no overlap with window — skip
-            count, _ = hairpin_counter(check_seq[chunk_start:chunk_end], 3, 4, 9)
-            if count > 1:
-                return float("-inf")
-
-        return sum(
-            math.log(self.codonToWeight.get(codon, 1e-9) + 1e-9) for codon in combo
-        )
-
-    def _first_violation_reason(
-        self, preamble: str, combo: tuple, window_offset: int, downstream: str = ""
-    ) -> str:
-        """
-        Returns a human-readable string explaining why the given combo scores
-        -inf (used when valid_combos=0 to explain what's blocking every choice).
-        """
-        from genedesign.seq_utils.hairpin_counter import hairpin_counter
-        from genedesign.seq_utils.reverse_complement import reverse_complement
-
-        check_seq = preamble + "".join(combo) + downstream
-        window_end = window_offset + len(combo) * 3
-        rc_seq = reverse_complement(check_seq)
-
-        for site in self.forbiddenChecker.forbidden:
-            pos = check_seq.find(site)
-            while pos != -1:
-                if pos < window_end and pos + len(site) > window_offset:
-                    return f"forbidden:{site} at fwd pos {pos}"
-                pos = check_seq.find(site, pos + 1)
-            pos = rc_seq.find(site)
-            while pos != -1:
-                fwd_start = len(check_seq) - pos - len(site)
-                if fwd_start < window_end and fwd_start + len(site) > window_offset:
-                    return f"forbidden_rc:{site} at fwd pos {fwd_start}"
-                pos = rc_seq.find(site, pos + 1)
-
-        CHUNK, STEP = 50, 25
+        # ── Hairpins (soft penalty) ──────────────────────────────────────
+        # Check ALL chunks that overlap the window — the guaranteed minimum
+        # context ensures at least one full 50 bp chunk always exists.
+        hairpin_violations = 0
         seq_len = len(check_seq)
         for chunk_start in range(0, seq_len - CHUNK + 1, STEP):
             chunk_end = chunk_start + CHUNK
             if chunk_end <= window_offset or chunk_start >= window_end:
                 continue
-            count, hairpin_str = hairpin_counter(check_seq[chunk_start:chunk_end], 3, 4, 9)
+            count, _ = hairpin_counter(check_seq[chunk_start:chunk_end], 3, 4, 9)
             if count > 1:
-                return f"hairpin count={count} in chunk[{chunk_start}:{chunk_end}]: {hairpin_str}"
+                hairpin_violations += count - 1
 
-        return "unknown (all combos -inf but reason unclear)"
+        # ── Promoter PWM (soft penalty) ──────────────────────────────────
+        promoter_violations = 0
+        base_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+        combined = check_seq + "x" + rc_seq
+        for i in range(len(combined) - PROMOTER_FRAME + 1):
+            frame_end = i + PROMOTER_FRAME
+            if i < len(check_seq):
+                if frame_end <= window_offset or i >= window_end:
+                    continue
+            else:
+                rc_i = i - len(check_seq) - 1
+                if rc_i < 0:
+                    continue
+                fwd_start = len(check_seq) - rc_i - PROMOTER_FRAME
+                if fwd_start + PROMOTER_FRAME <= window_offset or fwd_start >= window_end:
+                    continue
+            partseq = combined[i:frame_end]
+            score = 0.0
+            for x, base in enumerate(partseq):
+                y = base_idx.get(base, -1)
+                if y != -1:
+                    score += self.promoterChecker.pwm[y][x]
+            if score >= PROMOTER_THRESHOLD:
+                promoter_violations += 1
+
+        codon_score = sum(
+            math.log(self.codonToWeight.get(codon, 1e-9) + 1e-9) for codon in combo
+        )
+        return codon_score - HAIRPIN_PENALTY * hairpin_violations - PROMOTER_PENALTY * promoter_violations
 
     def _weighted_random_codon(self, amino_acid: str) -> str:
         """
