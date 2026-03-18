@@ -89,22 +89,22 @@ class TranscriptDesigner:
 
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
-        Builds the CDS left-to-right using a sliding 3-codon window.
+        Builds the CDS left-to-right using a sliding window.
 
-        For each window of 3 amino acids:
-          1. Enumerate all synonymous codon combinations (~<=216 for 3 AAs).
+        For each window of amino acids:
+          1. Enumerate all synonymous codon combinations.
           2. Evaluate each combination in local context:
-               preamble   -- last 9 bp of already-locked codons
-               window     -- the 3 codons under evaluation (9 bp)
+               preamble   -- last 50 bp of already-locked codons
+               window     -- the codons under evaluation
                downstream -- a random sample of the next 6 AAs (18 bp),
                              used only for context, then discarded
           3. Score: -inf if local sequence contains a forbidden site or
              hairpin; otherwise sum of log(codon_weight).
           4. Softmax-sample from valid combos (promotes codon diversity)
-             and lock the winner, then advance by 3.
+             and lock the winner, then advance the window.
 
-        After assembly a repair pass fixes boundary violations, then global
-        checks are run before RBS selection and final validation.
+        Global checks are run before RBS selection and final validation.
+        If checks fail, the entire assembly restarts from scratch.
 
         Parameters:
             peptide  (str): Protein sequence to reverse-translate.
@@ -118,7 +118,6 @@ class TranscriptDesigner:
                     # are locked. 4^5 = 1024 combos/step, still fast.
         DOWNSTREAM = 6  # AAs of random downstream context (discarded)
         MAX_RESTARTS = 100
-        MAX_REPAIRS = 2000
 
         self.log.info(
             "=== run() called | peptide_len=%d | peptide=%s%s",
@@ -137,14 +136,16 @@ class TranscriptDesigner:
                 win_end = min(win_start + WINDOW, len(peptide))
                 amino_window = peptide[win_start:win_end]
 
-                # 50 bp preamble matches hairpin_checker / _find_failing_region.
+                # 50 bp preamble matches hairpin_checker's chunk size.
                 preamble = "".join(locked)[-50:]
                 ds_aas = peptide[win_end : win_end + DOWNSTREAM]
                 downstream = "".join(self._weighted_random_codon(aa) for aa in ds_aas)
 
                 scored: list[tuple[tuple, float]] = []
                 for combo in self._enumerate_codon_combos(amino_window):
-                    check_seq = preamble + "".join(combo)
+                    # Include downstream so _score_window can see hairpin traps
+                    # that the current window sets up with future codons (AOT).
+                    check_seq = preamble + "".join(combo) + downstream
                     score = self._score_window(check_seq, combo, len(preamble))
                     scored.append((combo, score))
 
@@ -162,7 +163,7 @@ class TranscriptDesigner:
                     best_score = float("-inf")
                     # Log why every combo failed for this window.
                     reason = self._first_violation_reason(
-                        preamble, best_combo, len(preamble)
+                        preamble, best_combo, len(preamble), downstream
                     )
                     self.log.warning(
                         "  WINDOW aa[%d:%d] aas=%-6s | valid_combos=0 | "
@@ -178,81 +179,6 @@ class TranscriptDesigner:
                 zero_valid_windows, len(locked) * 3,
                 "".join(locked)[:30],
             )
-
-            # ── Repair pass ───────────────────────────────────────────────
-            # When enumeration produces no change the violation is caused by
-            # flanking locked context that the current window can't escape.
-            # We widen by 1 codon each side per STUCK_THRESHOLD stuck reps,
-            # but cap at MAX_EXTRA to avoid exponential enumeration blowup
-            # (6^n combos per repair attempt).  If widening to the cap still
-            # produces no change, the assembly is irresolvable — restart now
-            # rather than burning the full repair budget.
-            STUCK_THRESHOLD = 3  # stuck reps before widening
-            MAX_EXTRA = 2  # max extra codons each side (cap at 7 total)
-
-            repair_count = 0
-            stuck_at_pos = -1
-            stuck_streak = 0
-            irresolvable = False
-
-            for repair_idx in range(MAX_REPAIRS):
-                cds = "".join(locked)
-                fail_result = self._find_failing_region(cds)
-                if fail_result is None:
-                    break
-                fail_pos, fail_type, fail_detail = fail_result
-
-                codon_idx = fail_pos // 3
-
-                if fail_pos == stuck_at_pos:
-                    stuck_streak += 1
-                else:
-                    stuck_at_pos = fail_pos
-                    stuck_streak = 0
-
-                extra = min(stuck_streak // STUCK_THRESHOLD, MAX_EXTRA)
-                lo = max(0, codon_idx - 1 - extra)
-                hi = min(len(locked), codon_idx + 2 + extra)
-
-                before = "".join(locked[lo:hi])
-                self._repair_region(locked, peptide, lo, hi)
-                after = "".join(locked[lo:hi])
-                repair_count += 1
-
-                changed = before != after
-                self.log.debug(
-                    "  REPAIR #%d | %s:%s | pos=%d codon=%d | "
-                    "stuck=%d extra=%d | aa[%d:%d] | %s->%s | %s | "
-                    "ctx=...%s[%s]%s...",
-                    repair_count, fail_type, fail_detail,
-                    fail_pos, codon_idx,
-                    stuck_streak, extra, lo, hi,
-                    before, after,
-                    "CHANGED" if changed else "STUCK",
-                    cds[max(0, lo * 3 - 6) : lo * 3],
-                    cds[lo * 3 : hi * 3],
-                    cds[hi * 3 : hi * 3 + 6],
-                )
-
-                if not changed and extra >= MAX_EXTRA:
-                    self.log.warning(
-                        "  Irresolvable | %s:%s | pos=%d codon=%d | "
-                        "after %d repair(s) at max window — restarting.",
-                        fail_type, fail_detail, fail_pos, codon_idx, repair_count,
-                    )
-                    irresolvable = True
-                    break
-            else:
-                self.log.warning(
-                    "  Repair budget exhausted after %d attempts — restarting.",
-                    MAX_REPAIRS,
-                )
-                irresolvable = True
-
-            if irresolvable:
-                continue
-
-            self.log.info("  Repair pass done. %d repair(s) applied.", repair_count)
 
             # ── Codon quality check ───────────────────────────────────────
             codons_above_board, diversity, rare_count, cai = self.codonChecker.run(
@@ -300,9 +226,8 @@ class TranscriptDesigner:
 
             if passed_promoter and passed_hairpin and passed_forbidden and passed_rbs:
                 self.log.info(
-                    "SUCCESS | restarts_used=%d | repairs_applied=%d",
+                    "SUCCESS | restarts_used=%d",
                     restart_idx + 1,
-                    repair_count,
                 )
                 return Transcript(selected_rbs, peptide, locked)
 
@@ -342,32 +267,31 @@ class TranscriptDesigner:
         *window_offset* is len(preamble), i.e. the index in check_seq where the
         new codons start.
 
-        Violation detection is *differential*:
+        Violation detection:
           - Forbidden sequences: only rejected if the site overlaps the window
-            portion (starts or ends inside positions window_offset..end).  Sites
-            entirely within the preamble/downstream are the responsibility of the
-            codons that placed them and will be caught by earlier/later windows.
-          - Hairpins: only rejected if adding the window codons *increases* the
-            hairpin count vs the preamble alone.  This avoids blaming the current
-            combo for hairpins that were already present in locked context.
+            portion (starts or ends inside positions window_offset..window_end).
+          - Hairpins: uses chunk-based counting (50 bp chunks, 25 bp step)
+            matching hairpin_checker's threshold of count > 1.  Only chunks that
+            overlap the window region are evaluated — preamble-only chunks were
+            already validated when their codons were placed.  Including downstream
+            in check_seq means chunks that straddle the window-downstream boundary
+            are also checked, catching forward hairpin traps AOT.
         """
         from genedesign.seq_utils.hairpin_counter import hairpin_counter
         from genedesign.seq_utils.reverse_complement import reverse_complement
 
         window_end = window_offset + len(combo) * 3
+        CHUNK, STEP = 50, 25
 
         # ── Forbidden sequences (forward + RC) ────────────────────────────
         rc_seq = reverse_complement(check_seq)
         for site in self.forbiddenChecker.forbidden:
             site_len = len(site)
-            # Forward strand
             pos = check_seq.find(site)
             while pos != -1:
-                # Reject only if site overlaps the window region
                 if pos < window_end and pos + site_len > window_offset:
                     return float("-inf")
                 pos = check_seq.find(site, pos + 1)
-            # Reverse complement
             pos = rc_seq.find(site)
             while pos != -1:
                 fwd_start = len(check_seq) - pos - site_len
@@ -375,77 +299,26 @@ class TranscriptDesigner:
                     return float("-inf")
                 pos = rc_seq.find(site, pos + 1)
 
-        # ── Hairpins (differential) ────────────────────────────────────────
-        preamble_count, _ = hairpin_counter(check_seq[:window_offset], 3, 4, 9)
-        full_count, _     = hairpin_counter(check_seq, 3, 4, 9)
-        if full_count > preamble_count:
-            return float("-inf")
+        # ── Hairpins (chunk-based, mirrors hairpin_checker threshold) ──────
+        # Evaluate every 50 bp chunk that overlaps the window region.
+        # Downstream content (if present) extends check_seq so cross-boundary
+        # chunks are included automatically.
+        seq_len = len(check_seq)
+        for chunk_start in range(0, seq_len - CHUNK + 1, STEP):
+            chunk_end = chunk_start + CHUNK
+            if chunk_end <= window_offset or chunk_start >= window_end:
+                continue  # no overlap with window — skip
+            count, _ = hairpin_counter(check_seq[chunk_start:chunk_end], 3, 4, 9)
+            if count > 1:
+                return float("-inf")
 
         return sum(
             math.log(self.codonToWeight.get(codon, 1e-9) + 1e-9) for codon in combo
         )
 
-    def _repair_region(self, locked: list[str], peptide: str, lo: int, hi: int) -> None:
-        """
-        Re-enumerates all codon combos for positions lo..hi-1 using the
-        already-locked sequence as context on both sides, and replaces those
-        positions with the best-scoring combination found.
-        """
-        amino_window = peptide[lo:hi]
-        preamble = "".join(locked[:lo])[-50:]
-        downstream = "".join(locked[hi : hi + 18])
-
-        best_combo: tuple | None = None
-        best_score = float("-inf")
-
-        for combo in self._enumerate_codon_combos(amino_window):
-            check_seq = preamble + "".join(combo) + downstream
-            score = self._score_window(check_seq, combo, len(preamble))
-            if best_combo is None or score > best_score:
-                best_score = score
-                best_combo = combo
-
-        for j, codon in enumerate(best_combo):
-            locked[lo + j] = codon
-
-    def _find_failing_region(self, dna: str) -> tuple[int, str, str] | None:
-        """
-        Returns (approx_pos, violation_type, detail) for the first violation
-        found in *dna*, or None if the sequence is clean.
-
-        violation_type is one of: "hairpin", "forbidden", "forbidden_rc", "promoter"
-        detail is the offending sequence or site name.
-        """
-        from genedesign.seq_utils.hairpin_counter import hairpin_counter
-        from genedesign.seq_utils.reverse_complement import reverse_complement
-
-        chunk, step = 50, 25
-        for i in range(0, len(dna) - chunk + 1, step):
-            count, hairpin_str = hairpin_counter(dna[i : i + chunk], 3, 4, 9)
-            if count > 1:
-                return i + chunk // 2, "hairpin", hairpin_str or "?"
-
-        rc = reverse_complement(dna)
-        for site in self.forbiddenChecker.forbidden:
-            idx = dna.find(site)
-            if idx >= 0:
-                return idx + len(site) // 2, "forbidden", site
-            idx = rc.find(site)
-            if idx >= 0:
-                return len(dna) - idx - len(site) // 2, "forbidden_rc", site
-
-        passed, seq = self.promoterChecker.run(dna)
-        if not passed and seq:
-            idx = dna.find(seq)
-            if idx >= 0:
-                return idx + len(seq) // 2, "promoter", seq[:20]
-            idx = rc.find(seq)
-            if idx >= 0:
-                return len(dna) - idx - len(seq) // 2, "promoter_rc", seq[:20]
-
-        return None
-
-    def _first_violation_reason(self, preamble: str, combo: tuple, window_offset: int) -> str:
+    def _first_violation_reason(
+        self, preamble: str, combo: tuple, window_offset: int, downstream: str = ""
+    ) -> str:
         """
         Returns a human-readable string explaining why the given combo scores
         -inf (used when valid_combos=0 to explain what's blocking every choice).
@@ -453,7 +326,7 @@ class TranscriptDesigner:
         from genedesign.seq_utils.hairpin_counter import hairpin_counter
         from genedesign.seq_utils.reverse_complement import reverse_complement
 
-        check_seq = preamble + "".join(combo)
+        check_seq = preamble + "".join(combo) + downstream
         window_end = window_offset + len(combo) * 3
         rc_seq = reverse_complement(check_seq)
 
@@ -470,15 +343,19 @@ class TranscriptDesigner:
                     return f"forbidden_rc:{site} at fwd pos {fwd_start}"
                 pos = rc_seq.find(site, pos + 1)
 
-        preamble_count, _ = hairpin_counter(check_seq[:window_offset], 3, 4, 9)
-        full_count, hairpin_str = hairpin_counter(check_seq, 3, 4, 9)
-        if full_count > preamble_count:
-            return f"hairpin (preamble={preamble_count}→full={full_count}): {hairpin_str}"
+        CHUNK, STEP = 50, 25
+        seq_len = len(check_seq)
+        for chunk_start in range(0, seq_len - CHUNK + 1, STEP):
+            chunk_end = chunk_start + CHUNK
+            if chunk_end <= window_offset or chunk_start >= window_end:
+                continue
+            count, hairpin_str = hairpin_counter(check_seq[chunk_start:chunk_end], 3, 4, 9)
+            if count > 1:
+                return f"hairpin count={count} in chunk[{chunk_start}:{chunk_end}]: {hairpin_str}"
 
         return "unknown (all combos -inf but reason unclear)"
 
-        Returns:
-            list: The best codon combination for this window.
+    def _weighted_random_codon(self, amino_acid: str) -> str:
         """
         Samples a codon for *amino_acid* proportional to its usage frequency.
         """
@@ -495,7 +372,5 @@ if __name__ == "__main__":
     designer.initiate()
 
     ignores = set()
-    start_time = time.time()
     transcript = designer.run(peptide, ignores)
     print(transcript)
-    print(f"\nCompleted in {elapsed_time:.2f} seconds")
