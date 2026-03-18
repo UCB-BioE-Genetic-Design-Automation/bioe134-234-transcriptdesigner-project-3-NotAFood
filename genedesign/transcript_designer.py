@@ -477,7 +477,8 @@ class TranscriptDesigner:
 
         return "unknown (all combos -inf but reason unclear)"
 
-    def _weighted_random_codon(self, amino_acid: str) -> str:
+        Returns:
+            list: The best codon combination for this window.
         """
         Samples a codon for *amino_acid* proportional to its usage frequency.
         """
@@ -494,5 +495,7 @@ if __name__ == "__main__":
     designer.initiate()
 
     ignores = set()
+    start_time = time.time()
     transcript = designer.run(peptide, ignores)
     print(transcript)
+    print(f"\nCompleted in {elapsed_time:.2f} seconds")

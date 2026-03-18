@@ -134,7 +134,7 @@ This project has minimal dependencies, which can be installed using `pip` and a 
 
 If you run into errors finding paths, such as "ModuleNotFoundError: No module named 'genedesign" try putting this into the command line:
    ```bash
-   export PYTHONPATH=$(pwd)
+   `export PYTHONPATH=$(pwd)`
    ```
 
 6. To deactivate the virtual environment when finished:
