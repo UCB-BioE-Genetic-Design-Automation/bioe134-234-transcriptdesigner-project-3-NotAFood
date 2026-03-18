@@ -30,6 +30,10 @@ class InternalRBSChecker:
         self.start_codons = {"ATG", "GTG", "TTG"}
 
     def run(self, sequence: str):
+        """
+        Checks for internal RBS-like sequences in the provided DNA sequence.
+        For each RBS-like sequence found, it looks for a start codon within a defined
+        spacer region downstream of the RBS. If such a combination is found, it returns False along with the offending sequence. If no internal RBS-like sequences are found with a nearby start codon, it returns True."""
         for motif in self.rbs_like_sequences:
             idx = sequence.find(motif)
             while idx != -1:

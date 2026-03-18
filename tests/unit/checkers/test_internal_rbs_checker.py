@@ -1,0 +1,31 @@
+import pytest
+
+from genedesign.checkers.internal_rbs_checker import InternalRBSChecker
+
+
+@pytest.fixture
+def rbs_checker():
+    r = InternalRBSChecker()
+    r.initiate()
+    return r
+
+
+def test_detects_internal_rbs(rbs_checker):
+    # You construct this by hand, should return False because it contains an RBS
+    sequence = "...AGGAGG" + "NNNNNNN" + "ATG..."
+    result, offending_seq = rbs_checker.run(sequence)
+    assert not result
+    assert offending_seq is not None
+
+
+def test_clean_sequence_passes(rbs_checker):
+    # Pull from a known clean source
+    # lcl|X02723.1_cds_CAA26510.1_4 [db_xref=GOA:P0A9K7,InterPro:IPR008170,UniProtKB/Swiss-Prot:P0A9K7] [protein_id=CAA26510.1] [location=2845..3570] [gbkey=CDS]
+    clean_cds_sequence = "ATGGACAGTCTCAATCTTAATAAACATATTTCCGGCCAGTTCAACGCCGAACTGGAAAGTATCCGCACGCAGGTGATGACCATGGGCGGCATGGTGGAGCAGCAGCTTTCTGATGCAATCACCGCGATGCATAACCAGGACAGCGATCTGGCGAAGCGCGTCATCGAAGGCGACAAGAACGTCAACATGATGGAAGTGGCGATCGATGAAGCCTGCGTGCGCATTATCGCCAAACGTCAGCCGACGGCGAGCGACCTGCGACTGGTTATGGTGATCAGTAAAACCATTGCCGAGCTGGAGCGTATTGGCGACGTGGCGGACAAAATCTGCCGTACTGCGCTGGAGAAATTCTCCCAGCAGCATCAGCCGTTGCTGGTAAGTCTGGAGTCGCTGGGCCGTCATACCATCCAGATGCTGCACGACGTGCTGGACGCGTTCGCGCGGATGGACATTGACGAAGCGGTACGTATTTATCGTGAAGATAAAAAAGTCGATCAGGAATACGAAGGTATTGTTCGTCAACTGATGACCTACATGATGGAAGATTCGCGTACCATTCCGAGCGTACTTACTGCGCTGTTCTGCGCGCGTTCTATCGAACGTATTGGCGACCGCTGCCAGAATATTTGTGAGTTTATCTTCTACTACGTGAAGGGGCAGGATTTCCGTCACGTCGGTGGCGATGAGCTGGATAAACTGCTGGCGGGGAAAGATAGCGACAAATAA"
+    result, _ = rbs_checker.run(clean_cds_sequence)
+    assert result
+
+
+def test_sd_without_start_codon(rbs_checker):
+    result, _ = rbs_checker.run("AGGAGG")
+    assert result
