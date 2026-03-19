@@ -235,4 +235,12 @@ If no early stop triggers and all restarts are exhausted, a `RuntimeError` is ra
 
 ### Known Limitations
 
-The protein cdhC (Acetyl-CoA decarbonylase/synthase complex subunit beta, 524 AAs) contains the stretch `QPMAMQPMPMQMP` — four Methionines interspersed with Prolines. Methionine has only one codon (`ATG`), so the repeating `ATG...ATG...ATG` pattern is immutable. Exhaustive enumeration of all 4,096 synonymous codon combinations for this 12-amino-acid region confirms that every combination produces at least 2 hairpins within a 15 bp span. Both hairpins always fall within the same 50 bp checker chunks, so they cannot be distributed across chunk boundaries. This protein cannot pass the hairpin checker under the current parameters with any synonymous codon assignment.
+All four known failures stem from amino acids with very low codon diversity creating unavoidable hairpin stems. When two such stems fall within the same 50 bp checker chunk, no synonymous codon assignment can satisfy the hairpin threshold.
+
+- **cdhC** (Acetyl-CoA decarbonylase/synthase complex subunit beta, 524 AAs): contains the stretch `QPMAMQPMPMQMP` — four Methionines interspersed with Prolines. Exhaustive enumeration of all 4,096 synonymous codon combinations for this 12-amino-acid region confirms that every combination produces at least 2 hairpins within a 15 bp span. Both hairpins always fall within the same 50 bp checker chunks, so they cannot be distributed across chunk boundaries.
+
+- **pyrK** (Orotate phosphoribosyltransferase, 232 AAs): the starting `MY` dipeptide creates a fixed `ATG TAC`/`ATG TAT` pattern. Both Tyrosine codons form palindromic hairpin stems with the immutable Methionine codon, producing two hairpins that trigger early stop after 16 restarts.
+
+- **XD40_1108** (53 AAs): the `HHKW` region (positions 3–6) pairs two Histidine codons (`CAC`/`CAT`) with the single Tryptophan codon (`TGG`). The reverse complement `CCA` creates two persistent hairpins (`TGG...CCA` stems) that the repair loop cannot break. Exhausts all 500 restarts without triggering early stop because the loop sequences vary slightly between attempts.
+
+- **XD40_0590** (338 AAs): the `KFFPPEDFEK` region (codons ~50–59) creates persistent hairpins `GAA(ATTT)TTC` and `TTC(CCTCCT)GAA`. Phenylalanine (2 codons: `TTC`/`TTT`) and Glutamic acid (2 codons: `GAA`/`GAG`) both have low codon diversity, and the `TT`-rich F codons complement the `AA` in E codons. The intervening `PP` (Proline = `CC*`) provides the loop sequence that stabilizes the second stem. Triggers early stop after 36 restarts.

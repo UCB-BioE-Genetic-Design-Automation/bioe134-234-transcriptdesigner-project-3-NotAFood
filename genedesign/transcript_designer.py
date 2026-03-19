@@ -293,7 +293,7 @@ class TranscriptDesigner:
             passed_promoter, promoter_hit = self.promoterChecker.run(full_transcript)
             passed_hairpin, hairpin_hit = hairpin_checker(full_transcript)
             passed_forbidden, forb_hit = self.forbiddenChecker.run(full_transcript)
-            passed_rbs, _ = True, ""  # self.internalRBSChecker.run(cds)
+            passed_rbs, _ = self.internalRBSChecker.run(cds)
 
             self.log.info(
                 "  Final checks | promoter=%s(%s) | hairpin=%s(%s) | "
