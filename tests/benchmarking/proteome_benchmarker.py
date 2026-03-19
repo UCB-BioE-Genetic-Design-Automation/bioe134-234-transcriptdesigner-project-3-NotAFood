@@ -43,7 +43,7 @@ def parse_fasta(fasta_file):
     return sequences
 
 
-def benchmark_proteome(fasta_file):
+def benchmark_proteome(fasta_file, gene_filter=None):
     """
     Benchmarks the proteome using TranscriptDesigner.
     """
@@ -51,6 +51,12 @@ def benchmark_proteome(fasta_file):
     designer.initiate()
 
     proteome = parse_fasta(fasta_file)
+    if gene_filter:
+        proteome = {g: p for g, p in proteome.items() if g == gene_filter}
+        if not proteome:
+            print(f"Gene '{gene_filter}' not found in FASTA file.")
+            return [], []
+
     successful_results = []
     error_results = []
 
@@ -250,7 +256,7 @@ def generate_summary(
             f.write(f"- {checker}: {count} occurrences\n")
 
 
-def run_benchmark(fasta_file):
+def _run_benchmark(fasta_file, gene_filter=None):
     """
     Runs the complete benchmark process: parsing, running TranscriptDesigner, validating, and generating reports.
     """
@@ -258,7 +264,7 @@ def run_benchmark(fasta_file):
 
     # Benchmark the proteome
     parsing_start = time.time()
-    successful_results, error_results = benchmark_proteome(fasta_file)
+    successful_results, error_results = benchmark_proteome(fasta_file, gene_filter)
     parsing_time = time.time() - parsing_start
 
     # Analyze and log errors
@@ -280,5 +286,7 @@ def run_benchmark(fasta_file):
 
 
 if __name__ == "__main__":
+    import sys
     fasta_file = "tests/benchmarking/uniprotkb_proteome_UP000054015_2024_09_24.fasta"
-    run_benchmark(fasta_file)
+    gene_filter = sys.argv[1] if len(sys.argv) > 1 else None
+    _run_benchmark(fasta_file, gene_filter)

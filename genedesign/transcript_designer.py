@@ -112,8 +112,9 @@ class TranscriptDesigner:
         WINDOW = 3  # 3 codons (9 bp) per step
         DOWNSTREAM = 6  # 6 codons (18 bp) of random downstream context
         MAX_RESTARTS = 500
-        # Minimum context length so hairpin chunks (50 bp) always fit.
-        MIN_CONTEXT = 50
+        # Minimum context so hairpin chunks (50 bp) always fit; extra
+        # context lets the scorer catch hairpins between distant positions.
+        MIN_CONTEXT = 100
 
         random.seed(42)
 
@@ -433,6 +434,7 @@ class TranscriptDesigner:
         CHUNK, STEP = 50, 25
         utr_len = len(utr)
         tried: set[tuple[int, str]] = set()  # (codon_idx, codon) already used
+        codon_touch_count: dict[int, int] = {}  # how many times each codon idx was swapped
 
         def _local_hairpin_count(seq: str, region_start: int, region_end: int) -> int:
             """Count hairpin violations in all 50bp chunks overlapping a region."""
@@ -471,6 +473,17 @@ class TranscriptDesigner:
 
             if not hairpin_stems:
                 break
+
+            # Log failing chunk positions for visibility.
+            failing_positions = sorted(
+                {s for pair in hairpin_stems for s in pair}
+            )
+            self.log.info(
+                "    Repair pass %d: %d hairpin stems at seq positions %s",
+                pass_idx + 1,
+                len(hairpin_stems),
+                failing_positions[:10],
+            )
 
             # Try to break one hairpin per pass (re-check after each).
             fixed_any = False
@@ -532,21 +545,104 @@ class TranscriptDesigner:
                     tried.add((best_fix[0], best_fix[1]))
                     tried.add((best_fix[0], locked[best_fix[0]]))  # mark old codon too
                     locked[best_fix[0]] = best_fix[1]
+                    codon_touch_count[best_fix[0]] = codon_touch_count.get(best_fix[0], 0) + 1
+                    touches = codon_touch_count[best_fix[0]]
                     self.log.info(
-                        "    Repair pass %d: codon %d %s→%s (w=%.3f, local %d→%d)",
-                        pass_idx + 1,
+                        "      swap codon %d %s→%s (w=%.3f, local %d→%d, touches=%d)",
                         best_fix[0],
                         peptide[best_fix[0]],
                         best_fix[1],
                         best_weight,
                         current_local,
                         best_local,
+                        touches,
                     )
                     fixed_any = True
                     break  # Re-check full sequence after each swap
 
             if not fixed_any:
-                break
+                # ── Fallback: 2-codon swap for overlapping hairpins ───────
+                # When single swaps can't help (e.g. GCA…TGC…GCA where both
+                # hairpins share bases), try changing two codons at once.
+                for chunk_start in range(0, len(full_seq) - CHUNK + 1, STEP):
+                    chunk = full_seq[chunk_start : chunk_start + CHUNK]
+                    count, _ = hairpin_counter(chunk, 3, 4, 9)
+                    if count <= 1:
+                        continue
+                    # Codon indices overlapping this chunk.
+                    codon_idxs: list[int] = []
+                    for pos in range(chunk_start, chunk_start + CHUNK):
+                        cds_pos = pos - utr_len
+                        if 0 <= cds_pos < len(peptide) * 3:
+                            ci = cds_pos // 3
+                            if ci not in codon_idxs:
+                                codon_idxs.append(ci)
+
+                    current_local = _local_hairpin_count(
+                        full_seq, chunk_start, chunk_start + CHUNK
+                    )
+                    best_pair = None
+                    best_pair_weight = -1.0
+                    best_pair_local = current_local
+
+                    for ai, idx1 in enumerate(codon_idxs):
+                        aa1 = peptide[idx1]
+                        for c1, w1 in self.aminoAcidToCodons.get(aa1, []):
+                            if c1 == locked[idx1]:
+                                continue
+                            for idx2 in codon_idxs[ai + 1 :]:
+                                aa2 = peptide[idx2]
+                                for c2, w2 in self.aminoAcidToCodons.get(aa2, []):
+                                    if c2 == locked[idx2]:
+                                        continue
+                                    trial = locked[:]
+                                    trial[idx1] = c1
+                                    trial[idx2] = c2
+                                    trial_cds = "".join(trial) + "TAA"
+                                    trial_full = utr + trial_cds
+                                    tv = _local_hairpin_count(
+                                        trial_full, chunk_start, chunk_start + CHUNK
+                                    )
+                                    if tv < best_pair_local or (
+                                        tv == best_pair_local
+                                        and w1 + w2 > best_pair_weight
+                                    ):
+                                        best_pair = (idx1, c1, idx2, c2)
+                                        best_pair_weight = w1 + w2
+                                        best_pair_local = tv
+
+                    if best_pair and best_pair_local < current_local:
+                        i1, c1, i2, c2 = best_pair
+                        locked[i1] = c1
+                        locked[i2] = c2
+                        codon_touch_count[i1] = codon_touch_count.get(i1, 0) + 1
+                        codon_touch_count[i2] = codon_touch_count.get(i2, 0) + 1
+                        self.log.info(
+                            "      pair swap codons %d,%d → %s,%s (v %d→%d)",
+                            i1,
+                            i2,
+                            c1,
+                            c2,
+                            current_local,
+                            best_pair_local,
+                        )
+                        fixed_any = True
+                        break  # re-check after pair swap
+
+                if not fixed_any:
+                    break
+
+        # Summary of repair activity.
+        if codon_touch_count:
+            top_touched = sorted(
+                codon_touch_count.items(), key=lambda x: x[1], reverse=True
+            )[:5]
+            self.log.info(
+                "    Repair summary: %d passes, %d codons touched, top=%s",
+                pass_idx + 1 if 'pass_idx' in dir() else 0,
+                len(codon_touch_count),
+                [(idx, peptide[idx], cnt) for idx, cnt in top_touched],
+            )
 
         cds = "".join(locked) + "TAA"
         full_seq = utr + cds
