@@ -252,6 +252,13 @@ class TranscriptDesigner:
                 "".join(locked)[:30],
             )
 
+            # ── Targeted hairpin repair ────────────────────────────────────
+            locked, repair_ok = self._repair_hairpins(locked, utr, peptide)
+            if repair_ok:
+                self.log.info("  Hairpin repair: passed (or not needed)")
+            else:
+                self.log.info("  Hairpin repair: could not fix all hairpins")
+
             # ── Codon quality check (logged, not gated) ──────────────────
             codons_above_board, diversity, rare_count, cai = self.codonChecker.run(
                 locked
@@ -409,6 +416,142 @@ class TranscriptDesigner:
             - HAIRPIN_PENALTY * hairpin_violations
             - PROMOTER_PENALTY * promoter_violations
         )
+
+    def _repair_hairpins(
+        self, locked: list[str], utr: str, peptide: str, max_passes: int = 20
+    ) -> tuple[list[str], bool]:
+        """
+        Targeted post-assembly repair.  Finds 50 bp chunks with >1 hairpin,
+        identifies the exact stem pairs, and swaps the cheapest single codon
+        synonym to break each stem — only if the swap doesn't increase the
+        local hairpin count.  Tracks tried swaps to avoid oscillation.
+        Returns (locked, success).
+        """
+        from genedesign.seq_utils.hairpin_counter import hairpin_counter
+
+        _RC = {"A": "T", "T": "A", "C": "G", "G": "C"}
+        CHUNK, STEP = 50, 25
+        utr_len = len(utr)
+        tried: set[tuple[int, str]] = set()  # (codon_idx, codon) already used
+
+        def _local_hairpin_count(seq: str, region_start: int, region_end: int) -> int:
+            """Count hairpin violations in all 50bp chunks overlapping a region."""
+            total = 0
+            for cs in range(max(0, region_start - CHUNK + 1), min(len(seq) - CHUNK + 1, region_end), STEP):
+                count, _ = hairpin_counter(seq[cs : cs + CHUNK], 3, 4, 9)
+                if count > 1:
+                    total += count - 1
+            return total
+
+        for pass_idx in range(max_passes):
+            cds = "".join(locked) + "TAA"
+            full_seq = utr + cds
+
+            passed, _ = hairpin_checker(full_seq)
+            if passed:
+                return locked, True
+
+            # Collect all hairpin stem pairs in failing chunks.
+            hairpin_stems: list[tuple[int, int]] = []
+            for chunk_start in range(0, len(full_seq) - CHUNK + 1, STEP):
+                chunk = full_seq[chunk_start : chunk_start + CHUNK]
+                count, _ = hairpin_counter(chunk, 3, 4, 9)
+                if count <= 1:
+                    continue
+                for i in range(len(chunk) - 2):
+                    s1 = chunk[i : i + 3]
+                    for j in range(i + 7, min(i + 13, len(chunk) - 2)):
+                        s2 = chunk[j : j + 3]
+                        if (
+                            s1[0] == _RC.get(s2[2])
+                            and s1[1] == _RC.get(s2[1])
+                            and s1[2] == _RC.get(s2[0])
+                        ):
+                            hairpin_stems.append((chunk_start + i, chunk_start + j))
+
+            if not hairpin_stems:
+                break
+
+            # Try to break one hairpin per pass (re-check after each).
+            fixed_any = False
+            for stem_i, stem_j in hairpin_stems:
+                # Codon indices whose bases overlap either stem.
+                candidates: set[int] = set()
+                for pos in range(stem_i, stem_i + 3):
+                    cds_pos = pos - utr_len
+                    if 0 <= cds_pos < len(peptide) * 3:
+                        candidates.add(cds_pos // 3)
+                for pos in range(stem_j, stem_j + 3):
+                    cds_pos = pos - utr_len
+                    if 0 <= cds_pos < len(peptide) * 3:
+                        candidates.add(cds_pos // 3)
+
+                # Measure current local hairpin count around this stem.
+                region_start = min(stem_i, stem_j)
+                region_end = max(stem_i, stem_j) + 3
+                current_local = _local_hairpin_count(full_seq, region_start, region_end)
+
+                best_fix: tuple[int, str] | None = None
+                best_weight = -1.0
+                best_local = current_local
+
+                for idx in candidates:
+                    aa = peptide[idx]
+                    original = locked[idx]
+                    for codon, weight in self.aminoAcidToCodons.get(aa, []):
+                        if codon == original:
+                            continue
+                        if (idx, codon) in tried:
+                            continue
+                        # Would this swap break the stem RC match?
+                        trial = locked[:]
+                        trial[idx] = codon
+                        trial_cds = "".join(trial) + "TAA"
+                        trial_full = utr + trial_cds
+                        s1 = trial_full[stem_i : stem_i + 3]
+                        s2 = trial_full[stem_j : stem_j + 3]
+                        still_hairpin = (
+                            len(s1) == 3
+                            and len(s2) == 3
+                            and s1[0] == _RC.get(s2[2])
+                            and s1[1] == _RC.get(s2[1])
+                            and s1[2] == _RC.get(s2[0])
+                        )
+                        if still_hairpin:
+                            continue
+                        # Check that this swap doesn't increase local hairpins.
+                        new_local = _local_hairpin_count(trial_full, region_start, region_end)
+                        if new_local > best_local:
+                            continue
+                        if new_local < best_local or weight > best_weight:
+                            best_fix = (idx, codon)
+                            best_weight = weight
+                            best_local = new_local
+
+                if best_fix:
+                    tried.add((best_fix[0], best_fix[1]))
+                    tried.add((best_fix[0], locked[best_fix[0]]))  # mark old codon too
+                    locked[best_fix[0]] = best_fix[1]
+                    self.log.info(
+                        "    Repair pass %d: codon %d %s→%s (w=%.3f, local %d→%d)",
+                        pass_idx + 1,
+                        best_fix[0],
+                        peptide[best_fix[0]],
+                        best_fix[1],
+                        best_weight,
+                        current_local,
+                        best_local,
+                    )
+                    fixed_any = True
+                    break  # Re-check full sequence after each swap
+
+            if not fixed_any:
+                break
+
+        cds = "".join(locked) + "TAA"
+        full_seq = utr + cds
+        passed, _ = hairpin_checker(full_seq)
+        return locked, passed
 
     @staticmethod
     def _boundary_hairpin_count(preamble_tail: str, combo_seq: str) -> int:
