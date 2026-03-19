@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import random
 from datetime import datetime
 from itertools import product
@@ -19,9 +20,9 @@ def _setup_logger() -> logging.Logger:
     """Creates a file logger writing to logs/<YYYY-MM-DD_HH-MM-SS>.log."""
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    log_path = log_dir / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{os.getpid()}.log"
 
-    logger = logging.getLogger("transcript_designer")
+    logger = logging.getLogger(f"transcript_designer_{os.getpid()}")
     logger.setLevel(logging.DEBUG)
     # Avoid duplicate handlers if initiate() is called more than once.
     logger.handlers.clear()

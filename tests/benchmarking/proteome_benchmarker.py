@@ -2,6 +2,7 @@ import os
 import traceback
 import csv
 import time
+from multiprocessing import Pool, cpu_count
 from statistics import mean
 from genedesign.seq_utils.translate import Translate
 from genedesign.transcript_designer import TranscriptDesigner
@@ -43,13 +44,30 @@ def parse_fasta(fasta_file):
     return sequences
 
 
-def benchmark_proteome(fasta_file, gene_filter=None):
-    """
-    Benchmarks the proteome using TranscriptDesigner.
-    """
-    designer = TranscriptDesigner()
-    designer.initiate()
+def _worker_init():
+    """Initialize a TranscriptDesigner in each worker process."""
+    global _designer
+    _designer = TranscriptDesigner()
+    _designer.initiate()
 
+
+def _process_gene(args):
+    """Process a single gene in a worker process."""
+    gene, protein = args
+    ignores = set()
+    try:
+        transcript = _designer.run(protein, ignores)
+        print(f"  SUCCESS: {gene} (len={len(protein)})")
+        return ("success", {"gene": gene, "protein": protein, "transcript": transcript})
+    except Exception as e:
+        print(f"  FAILED: {gene} (len={len(protein)}) — {e}")
+        return ("error", {"gene": gene, "error": traceback.format_exc()})
+
+
+def benchmark_proteome(fasta_file, gene_filter=None, num_workers=None):
+    """
+    Benchmarks the proteome using TranscriptDesigner in parallel.
+    """
     proteome = parse_fasta(fasta_file)
     if gene_filter:
         proteome = {g: p for g, p in proteome.items() if g == gene_filter}
@@ -57,23 +75,16 @@ def benchmark_proteome(fasta_file, gene_filter=None):
             print(f"Gene '{gene_filter}' not found in FASTA file.")
             return [], []
 
-    successful_results = []
-    error_results = []
+    if num_workers is None:
+        num_workers = min(cpu_count(), len(proteome))
 
-    for gene, protein in proteome.items():
-        print(f"Processing gene: {gene} with protein sequence: {protein[:30]}...")
-        ignores = set()
-        try:
-            transcript = designer.run(protein, ignores)
-            print(f"  SUCCESS: {gene} (len={len(protein)})")
-            successful_results.append(
-                {"gene": gene, "protein": protein, "transcript": transcript}
-            )
-        except Exception as e:
-            print(f"  FAILED: {gene} (len={len(protein)}) — {e}")
-            error_results.append(
-                {"gene": gene, "error": traceback.format_exc()}
-            )
+    print(f"Processing {len(proteome)} genes with {num_workers} workers...")
+
+    with Pool(num_workers, initializer=_worker_init) as pool:
+        results = pool.map(_process_gene, proteome.items())
+
+    successful_results = [r[1] for r in results if r[0] == "success"]
+    error_results = [r[1] for r in results if r[0] == "error"]
 
     return successful_results, error_results
 
