@@ -93,11 +93,12 @@ class TranscriptDesigner:
         """
         Builds the CDS left-to-right using a greedy sliding window.
 
-        For each window of amino acids:
-          1. Enumerate all synonymous codon combinations.
-          2. Score each in context: UTR/locked preamble (>=50 bp) + window +
-             random downstream (18 bp).  Forbidden sequences are hard-rejected;
-             hairpins and promoters are penalised.
+        For each 3-codon (9 bp) window:
+          1. Enumerate all synonymous codon combinations (~216 max).
+          2. Score each in context: preamble (9 bp already locked) +
+             window (9 bp being optimised) + downstream (18 bp random).
+             Forbidden sequences are hard-rejected; hairpins and promoters
+             are soft-penalised.
           3. Pick the best-scoring combo (greedy) and lock it.
 
         Restarts vary because downstream context is randomly sampled each time.
@@ -109,9 +110,9 @@ class TranscriptDesigner:
         Returns:
             Transcript: Validated transcript with RBS and codon list.
         """
-        WINDOW = 5
-        DOWNSTREAM = 6
-        MAX_RESTARTS = 100
+        WINDOW = 3  # 3 codons (9 bp) per step
+        DOWNSTREAM = 6  # 6 codons (18 bp) of random downstream context
+        MAX_RESTARTS = 500
         # Minimum context length so hairpin chunks (50 bp) always fit.
         MIN_CONTEXT = 50
 
@@ -134,41 +135,58 @@ class TranscriptDesigner:
             locked: list[str] = []
 
             # ── Sliding window assembly ───────────────────────────────────
+            # Evaluate WINDOW (3) codons at a time but only lock the first
+            # codon, then advance by 1.  Each codon gets evaluated in up to
+            # 3 different window positions before it is committed, giving
+            # the algorithm multiple chances to avoid hairpins.
             zero_valid_windows = 0
-            for win_start in range(0, len(peptide), WINDOW):
-                win_end = min(win_start + WINDOW, len(peptide))
-                amino_window = peptide[win_start:win_end]
+            for aa_idx in range(len(peptide)):
+                win_end = min(aa_idx + WINDOW, len(peptide))
+                amino_window = peptide[aa_idx:win_end]
 
-                # Build preamble: UTR + all locked codons, then take the
-                # last MIN_CONTEXT characters.  This guarantees that even
-                # the first window has enough context for a full 50 bp
-                # hairpin chunk to be evaluated.
                 full_prefix = utr + "".join(locked)
-                preamble = full_prefix[-MIN_CONTEXT:] if len(full_prefix) > MIN_CONTEXT else full_prefix
+                preamble = (
+                    full_prefix[-MIN_CONTEXT:]
+                    if len(full_prefix) > MIN_CONTEXT
+                    else full_prefix
+                )
 
                 ds_aas = peptide[win_end : win_end + DOWNSTREAM]
                 downstream = "".join(self._weighted_random_codon(aa) for aa in ds_aas)
-                # Pad downstream so check_seq is always >= MIN_CONTEXT + window.
-                while len(preamble) + len(amino_window) * 3 + len(downstream) < MIN_CONTEXT + len(amino_window) * 3:
+                while (
+                    len(preamble) + len(amino_window) * 3 + len(downstream)
+                    < MIN_CONTEXT + len(amino_window) * 3
+                ):
                     downstream += random.choice("ACGT")
 
-                best_combo = None
-                best_score = float("-inf")
+                # Score all combos, then randomly pick among those within
+                # a small margin of the best.  This breaks deterministic
+                # ties that cause the same hairpin every restart.
+                NEAR_BEST_MARGIN = 1.0
+                scored: list[tuple[tuple, float]] = []
                 for combo in self._enumerate_codon_combos(amino_window):
                     check_seq = preamble + "".join(combo) + downstream
                     score = self._score_window(check_seq, combo, len(preamble))
-                    if score > best_score:
-                        best_score = score
-                        best_combo = combo
+                    scored.append((combo, score))
+
+                best_score = max(s for _, s in scored)
 
                 if best_score <= float("-inf"):
                     zero_valid_windows += 1
+                    chosen = max(scored, key=lambda x: x[1])[0]
+                else:
+                    near_best = [
+                        c for c, s in scored if s >= best_score - NEAR_BEST_MARGIN
+                    ]
+                    chosen = random.choice(near_best)
 
-                locked.extend(best_combo)
+                # Lock only the first codon of the chosen combo.
+                locked.append(chosen[0])
 
             self.log.info(
                 "  Assembly done | zero_valid_windows=%d | cds_len=%d | cds_head=%s",
-                zero_valid_windows, len(locked) * 3,
+                zero_valid_windows,
+                len(locked) * 3,
                 "".join(locked)[:30],
             )
 
@@ -295,7 +313,7 @@ class TranscriptDesigner:
 
         # ── Promoter PWM (soft penalty) ──────────────────────────────────
         promoter_violations = 0
-        base_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+        base_idx = {"A": 0, "C": 1, "G": 2, "T": 3}
         combined = check_seq + "x" + rc_seq
         for i in range(len(combined) - PROMOTER_FRAME + 1):
             frame_end = i + PROMOTER_FRAME
@@ -307,7 +325,10 @@ class TranscriptDesigner:
                 if rc_i < 0:
                     continue
                 fwd_start = len(check_seq) - rc_i - PROMOTER_FRAME
-                if fwd_start + PROMOTER_FRAME <= window_offset or fwd_start >= window_end:
+                if (
+                    fwd_start + PROMOTER_FRAME <= window_offset
+                    or fwd_start >= window_end
+                ):
                     continue
             partseq = combined[i:frame_end]
             score = 0.0
@@ -321,7 +342,11 @@ class TranscriptDesigner:
         codon_score = sum(
             math.log(self.codonToWeight.get(codon, 1e-9) + 1e-9) for codon in combo
         )
-        return codon_score - HAIRPIN_PENALTY * hairpin_violations - PROMOTER_PENALTY * promoter_violations
+        return (
+            codon_score
+            - HAIRPIN_PENALTY * hairpin_violations
+            - PROMOTER_PENALTY * promoter_violations
+        )
 
     def _weighted_random_codon(self, amino_acid: str) -> str:
         """
