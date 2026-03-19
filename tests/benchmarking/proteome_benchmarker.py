@@ -63,11 +63,17 @@ def benchmark_proteome(fasta_file, gene_filter=None):
     for gene, protein in proteome.items():
         print(f"Processing gene: {gene} with protein sequence: {protein[:30]}...")
         ignores = set()
-        transcript = designer.run(protein, ignores)
-        print(f"  SUCCESS: {gene} (len={len(protein)})")
-        successful_results.append(
-            {"gene": gene, "protein": protein, "transcript": transcript}
-        )
+        try:
+            transcript = designer.run(protein, ignores)
+            print(f"  SUCCESS: {gene} (len={len(protein)})")
+            successful_results.append(
+                {"gene": gene, "protein": protein, "transcript": transcript}
+            )
+        except Exception as e:
+            print(f"  FAILED: {gene} (len={len(protein)}) — {e}")
+            error_results.append(
+                {"gene": gene, "error": traceback.format_exc()}
+            )
 
     return successful_results, error_results
 

@@ -132,6 +132,10 @@ class TranscriptDesigner:
                 utr = rbsopt.utr.upper()
                 break
 
+        consecutive_same_hairpin = 0
+        last_hairpin_sig = None
+        EARLY_STOP = 15  # give up if same hairpin pattern repeats this many times
+
         for restart_idx in range(MAX_RESTARTS):
             self.log.info("--- Restart %d/%d ---", restart_idx + 1, MAX_RESTARTS)
             locked: list[str] = []
@@ -308,6 +312,24 @@ class TranscriptDesigner:
                     restart_idx + 1,
                 )
                 return Transcript(selected_rbs, peptide, locked)
+
+            # Early stop: if the same hairpin signature repeats, the region
+            # is likely inherently unfixable (e.g. repeated ATG-only codons).
+            hairpin_sig = hairpin_hit or ""
+            if hairpin_sig == last_hairpin_sig and hairpin_sig:
+                consecutive_same_hairpin += 1
+            else:
+                consecutive_same_hairpin = 0
+                last_hairpin_sig = hairpin_sig
+
+            if consecutive_same_hairpin >= EARLY_STOP:
+                self.log.warning(
+                    "EARLY STOP after %d restarts — same hairpin pattern repeated %d times: %s",
+                    restart_idx + 1,
+                    EARLY_STOP,
+                    hairpin_sig.replace("\n", " "),
+                )
+                break
 
             self.log.info("  Final checks failed — restarting.")
 
