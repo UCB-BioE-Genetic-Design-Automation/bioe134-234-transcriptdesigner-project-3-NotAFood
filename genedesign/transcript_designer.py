@@ -13,7 +13,6 @@ from genedesign.checkers.internal_rbs_checker import InternalRBSChecker
 from genedesign.models.transcript import Transcript
 from genedesign.rbs_chooser import RBSChooser
 
-random.seed(42)
 
 
 def _setup_logger() -> logging.Logger:
@@ -116,6 +115,8 @@ class TranscriptDesigner:
         # Minimum context length so hairpin chunks (50 bp) always fit.
         MIN_CONTEXT = 50
 
+        random.seed(42)
+
         self.log.info(
             "=== run() called | peptide_len=%d | peptide=%s%s",
             len(peptide),
@@ -134,15 +135,19 @@ class TranscriptDesigner:
             self.log.info("--- Restart %d/%d ---", restart_idx + 1, MAX_RESTARTS)
             locked: list[str] = []
 
-            # ── Sliding window assembly ───────────────────────────────────
-            # Evaluate WINDOW (3) codons at a time but only lock the first
-            # codon, then advance by 1.  Each codon gets evaluated in up to
-            # 3 different window positions before it is committed, giving
-            # the algorithm multiple chances to avoid hairpins.
+            # ── Sliding window assembly with backtracking ────────────────
+            # Advance by WINDOW codons.  If every combo in a window is
+            # penalised (best_score includes hairpin/promoter penalties),
+            # backtrack by removing the previous BACKTRACK codons and
+            # re-evaluate the combined region with a wider window.
+            BACKTRACK = 2
+            NEAR_BEST_MARGIN = 1.0
             zero_valid_windows = 0
-            for aa_idx in range(len(peptide)):
-                win_end = min(aa_idx + WINDOW, len(peptide))
-                amino_window = peptide[aa_idx:win_end]
+            backtrack_used = set()  # positions already backtracked from
+            win_start = 0
+            while win_start < len(peptide):
+                win_end = min(win_start + WINDOW, len(peptide))
+                amino_window = peptide[win_start:win_end]
 
                 full_prefix = utr + "".join(locked)
                 preamble = (
@@ -159,10 +164,6 @@ class TranscriptDesigner:
                 ):
                     downstream += random.choice("ACGT")
 
-                # Score all combos, then randomly pick among those within
-                # a small margin of the best.  This breaks deterministic
-                # ties that cause the same hairpin every restart.
-                NEAR_BEST_MARGIN = 1.0
                 scored: list[tuple[tuple, float]] = []
                 for combo in self._enumerate_codon_combos(amino_window):
                     check_seq = preamble + "".join(combo) + downstream
@@ -171,17 +172,66 @@ class TranscriptDesigner:
 
                 best_score = max(s for _, s in scored)
 
+                # Compute the best possible pure codon score (no penalties).
+                # If the actual best is significantly below this, a penalty
+                # was applied — backtrack to escape.
+                best_codon_only = max(
+                    sum(
+                        math.log(self.codonToWeight.get(c, 1e-9) + 1e-9)
+                        for c in combo
+                    )
+                    for combo, _ in scored
+                )
+                has_penalties = best_score < best_codon_only - 10.0
+
+                if has_penalties and win_start > 0 and win_start not in backtrack_used:
+                    backtrack_used.add(win_start)
+                    bt = min(BACKTRACK, win_start)
+                    locked = locked[:-bt]
+                    win_start -= bt
+                    # Retry with the wider window (previous codons + current).
+                    win_end = min(win_start + WINDOW + bt, len(peptide))
+                    amino_window = peptide[win_start:win_end]
+
+                    full_prefix = utr + "".join(locked)
+                    preamble = (
+                        full_prefix[-MIN_CONTEXT:]
+                        if len(full_prefix) > MIN_CONTEXT
+                        else full_prefix
+                    )
+                    ds_aas = peptide[win_end : win_end + DOWNSTREAM]
+                    downstream = "".join(
+                        self._weighted_random_codon(aa) for aa in ds_aas
+                    )
+                    while (
+                        len(preamble) + len(amino_window) * 3 + len(downstream)
+                        < MIN_CONTEXT + len(amino_window) * 3
+                    ):
+                        downstream += random.choice("ACGT")
+
+                    scored = []
+                    for combo in self._enumerate_codon_combos(amino_window):
+                        check_seq = preamble + "".join(combo) + downstream
+                        score = self._score_window(
+                            check_seq, combo, len(preamble)
+                        )
+                        scored.append((combo, score))
+
+                    best_score = max(s for _, s in scored)
+
                 if best_score <= float("-inf"):
                     zero_valid_windows += 1
                     chosen = max(scored, key=lambda x: x[1])[0]
                 else:
                     near_best = [
-                        c for c, s in scored if s >= best_score - NEAR_BEST_MARGIN
+                        c
+                        for c, s in scored
+                        if s >= best_score - NEAR_BEST_MARGIN
                     ]
                     chosen = random.choice(near_best)
 
-                # Lock only the first codon of the chosen combo.
-                locked.append(chosen[0])
+                locked.extend(chosen)
+                win_start += len(chosen)
 
             self.log.info(
                 "  Assembly done | zero_valid_windows=%d | cds_len=%d | cds_head=%s",
