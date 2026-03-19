@@ -165,8 +165,15 @@ class TranscriptDesigner:
                     downstream += random.choice("ACGT")
 
                 scored: list[tuple[tuple, float]] = []
+                preamble_tail = preamble[-15:] if len(preamble) >= 15 else preamble
                 for combo in self._enumerate_codon_combos(amino_window):
-                    check_seq = preamble + "".join(combo) + downstream
+                    combo_seq = "".join(combo)
+                    # Cheap pre-filter: skip combos that create 2+ hairpins
+                    # at the boundary before running the expensive scorer.
+                    if self._boundary_hairpin_count(preamble_tail, combo_seq) >= 2:
+                        scored.append((combo, float("-inf")))
+                        continue
+                    check_seq = preamble + combo_seq + downstream
                     score = self._score_window(check_seq, combo, len(preamble))
                     scored.append((combo, score))
 
@@ -210,8 +217,13 @@ class TranscriptDesigner:
                         downstream += random.choice("ACGT")
 
                     scored = []
+                    preamble_tail = preamble[-15:] if len(preamble) >= 15 else preamble
                     for combo in self._enumerate_codon_combos(amino_window):
-                        check_seq = preamble + "".join(combo) + downstream
+                        combo_seq = "".join(combo)
+                        if self._boundary_hairpin_count(preamble_tail, combo_seq) >= 2:
+                            scored.append((combo, float("-inf")))
+                            continue
+                        check_seq = preamble + combo_seq + downstream
                         score = self._score_window(
                             check_seq, combo, len(preamble)
                         )
@@ -397,6 +409,32 @@ class TranscriptDesigner:
             - HAIRPIN_PENALTY * hairpin_violations
             - PROMOTER_PENALTY * promoter_violations
         )
+
+    @staticmethod
+    def _boundary_hairpin_count(preamble_tail: str, combo_seq: str) -> int:
+        """
+        Cheap hairpin count at the preamble–combo boundary.
+
+        Checks whether any 3-mer in the combined region has its reverse
+        complement 7-12 positions downstream (matching hairpin_counter's
+        min_stem=3, min_loop=4, max_loop=9).  Only counts hairpins where
+        at least one stem overlaps the combo region.
+        """
+        _RC = {"A": "T", "T": "A", "C": "G", "G": "C"}
+        combined = preamble_tail + combo_seq
+        combo_start = len(preamble_tail)
+        count = 0
+        clen = len(combined)
+        for i in range(clen - 2):
+            s1 = combined[i : i + 3]
+            for j in range(i + 7, min(i + 13, clen - 2)):
+                # At least one stem must touch the combo region.
+                if j + 3 <= combo_start and i + 3 <= combo_start:
+                    continue
+                s2 = combined[j : j + 3]
+                if s1[0] == _RC.get(s2[2]) and s1[1] == _RC.get(s2[1]) and s1[2] == _RC.get(s2[0]):
+                    count += 1
+        return count
 
     def _weighted_random_codon(self, amino_acid: str) -> str:
         """
