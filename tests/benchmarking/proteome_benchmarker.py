@@ -1,15 +1,135 @@
-import os
-import traceback
 import csv
+import json
+import os
 import time
+import traceback
 from multiprocessing import Pool, cpu_count
 from statistics import mean
-from genedesign.seq_utils.translate import Translate
-from genedesign.transcript_designer import TranscriptDesigner
-from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
-from genedesign.checkers.internal_promoter_checker import PromoterChecker
-from genedesign.checkers.hairpin_checker import hairpin_checker
+
 from genedesign.checkers.codon_checker import CodonChecker
+from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
+from genedesign.checkers.hairpin_checker import hairpin_checker
+from genedesign.checkers.internal_promoter_checker import PromoterChecker
+from genedesign.models.rbs_option import RBSOption
+from genedesign.models.transcript import Transcript
+from genedesign.seq_utils.translate import Translate
+from genedesign.transcript_designer import CACHE_VERSION, TranscriptDesigner
+
+# ---------------------------------------------------------------------------
+# Checkpoint / resume design rationale
+# ---------------------------------------------------------------------------
+# A proteome benchmark can take hours.  To avoid losing progress on a crash
+# or keyboard-interrupt, results are saved incrementally to a JSON checkpoint
+# file after each gene completes.
+#
+# Cache invalidation key: CACHE_VERSION constant in genedesign/transcript_designer.py
+#
+# TranscriptDesigner is the only file whose changes affect output correctness.
+# Rather than hashing the whole file (which would bust the cache on every
+# tuning edit such as changing max iterations or retry counts), we rely on a
+# manually maintained CACHE_VERSION string defined there.  Developers must bump
+# CACHE_VERSION only when the algorithm changes in a way that would produce
+# different outputs for the same input — leave it unchanged for parameter-only
+# edits whose results remain valid.
+#
+# If the version stored in the checkpoint differs from the current value, the
+# checkpoint is discarded and the run starts from scratch.
+#
+# Checkpointing is disabled when a gene_filter is active (single-gene runs
+# are fast and should not pollute the full-proteome checkpoint).
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_FILE = "benchmark_checkpoint.json"
+
+
+def _get_cache_key() -> str:
+    """Return the current cache invalidation key for benchmark results.
+
+    This is the CACHE_VERSION constant from transcript_designer.py.  Bump that
+    constant (not this function) when algorithm changes would make cached
+    results invalid.  Tuning-only edits (max iterations, retry counts, etc.)
+    do not require a bump.
+    """
+    return CACHE_VERSION
+
+
+def _serialize_success(result: dict) -> dict:
+    """Convert a success result (containing a Transcript object) to JSON-safe dict."""
+    t = result["transcript"]
+    return {
+        "gene": result["gene"],
+        "protein": result["protein"],
+        "codons": list(t.codons),
+        "rbs_utr": t.rbs.utr,
+        "rbs_cds": t.rbs.cds,
+        "rbs_gene_name": t.rbs.gene_name,
+        "rbs_first_six_aas": t.rbs.first_six_aas,
+    }
+
+
+def _deserialize_success(data: dict) -> dict:
+    """Reconstruct a success result dict (with Transcript) from a checkpoint entry."""
+    rbs = RBSOption(
+        utr=data["rbs_utr"],
+        cds=data["rbs_cds"],
+        gene_name=data["rbs_gene_name"],
+        first_six_aas=data["rbs_first_six_aas"],
+    )
+    transcript = Transcript(rbs=rbs, peptide=data["protein"], codons=data["codons"])
+    return {"gene": data["gene"], "protein": data["protein"], "transcript": transcript}
+
+
+def _load_checkpoint(path: str, current_hash: str) -> tuple[list, list, set]:
+    """
+    Load a checkpoint file if it exists and its stored hash matches current_hash.
+
+    Returns (successful_results, error_results, completed_genes).
+    If the file is absent or the hash mismatches, returns empty collections and
+    prints a message explaining why the run starts fresh.
+    """
+    if not os.path.exists(path):
+        return [], [], set()
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, KeyError):
+        print(f"Checkpoint file '{path}' is corrupt — starting fresh.")
+        return [], [], set()
+
+    stored_hash = data.get("transcript_designer_hash", "")
+    if stored_hash != current_hash:
+        print(
+            f"CACHE_VERSION has changed ('{stored_hash}' → '{current_hash}') — "
+            f"discarding checkpoint and starting fresh."
+        )
+        return [], [], set()
+
+    successful_results = [_deserialize_success(r) for r in data.get("successes", [])]
+    error_results = data.get("errors", [])
+    completed_genes = {r["gene"] for r in successful_results} | {
+        r["gene"] for r in error_results
+    }
+    print(
+        f"Resuming from checkpoint: {len(completed_genes)} genes already done "
+        f"({len(successful_results)} success, {len(error_results)} error)."
+    )
+    return successful_results, error_results, completed_genes
+
+
+def _save_checkpoint(
+    path: str, designer_hash: str, successes: list, errors: list
+) -> None:
+    """Atomically write current results to the checkpoint file."""
+    tmp_path = path + ".tmp"
+    payload = {
+        "transcript_designer_hash": designer_hash,
+        "successes": [_serialize_success(r) for r in successes],
+        "errors": errors,
+    }
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp_path, path)
 
 
 def parse_fasta(fasta_file):
@@ -45,14 +165,23 @@ def parse_fasta(fasta_file):
 
 
 def _worker_init():
-    """Initialize a TranscriptDesigner in each worker process."""
+    """Initialize a TranscriptDesigner in each MP worker (logging suppressed)."""
+    import logging
+    logging.disable(logging.CRITICAL)
+    global _designer
+    _designer = TranscriptDesigner()
+    _designer.initiate()
+
+
+def _init_sequential():
+    """Initialize a TranscriptDesigner in the main process (logging enabled)."""
     global _designer
     _designer = TranscriptDesigner()
     _designer.initiate()
 
 
 def _process_gene(args):
-    """Process a single gene in a worker process."""
+    """Process a single gene."""
     gene, protein = args
     ignores = set()
     try:
@@ -64,9 +193,17 @@ def _process_gene(args):
         return ("error", {"gene": gene, "error": traceback.format_exc()})
 
 
-def benchmark_proteome(fasta_file, gene_filter=None, num_workers=None):
+def benchmark_proteome(fasta_file, gene_filter=None, use_mp=False):
     """
-    Benchmarks the proteome using TranscriptDesigner in parallel.
+    Benchmarks the proteome using TranscriptDesigner.
+
+    When use_mp=True, genes are processed in parallel across all available
+    CPUs and logging is suppressed in workers.  When False, genes are
+    processed sequentially in the main process with logging enabled.
+
+    When gene_filter is None, results are checkpointed after every completed
+    gene so that an interrupted run can resume without reprocessing finished
+    genes.  See module-level docstring for the cache-invalidation strategy.
     """
     proteome = parse_fasta(fasta_file)
     if gene_filter:
@@ -75,16 +212,49 @@ def benchmark_proteome(fasta_file, gene_filter=None, num_workers=None):
             print(f"Gene '{gene_filter}' not found in FASTA file.")
             return [], []
 
-    if num_workers is None:
-        num_workers = min(cpu_count(), len(proteome))
+    use_checkpoint = gene_filter is None
 
-    print(f"Processing {len(proteome)} genes with {num_workers} workers...")
+    if use_checkpoint:
+        cache_key = _get_cache_key()
+        successful_results, error_results, completed_genes = _load_checkpoint(
+            CHECKPOINT_FILE, cache_key
+        )
+        remaining = {g: p for g, p in proteome.items() if g not in completed_genes}
+    else:
+        cache_key = None
+        successful_results, error_results = [], []
+        remaining = proteome
 
-    with Pool(num_workers, initializer=_worker_init) as pool:
-        results = pool.map(_process_gene, proteome.items())
+    if not remaining:
+        print("All genes already completed — nothing left to process.")
+        return successful_results, error_results
 
-    successful_results = [r[1] for r in results if r[0] == "success"]
-    error_results = [r[1] for r in results if r[0] == "error"]
+    if use_mp:
+        num_workers = min(cpu_count(), len(remaining))
+        print(f"Processing {len(remaining)} genes with {num_workers} workers (MP, logging disabled)...")
+        with Pool(num_workers, initializer=_worker_init) as pool:
+            for status, result in pool.imap_unordered(_process_gene, remaining.items()):
+                if status == "success":
+                    successful_results.append(result)
+                else:
+                    error_results.append(result)
+                if use_checkpoint:
+                    _save_checkpoint(
+                        CHECKPOINT_FILE, cache_key, successful_results, error_results
+                    )
+    else:
+        print(f"Processing {len(remaining)} genes (sequential, logging enabled)...")
+        _init_sequential()
+        for args in remaining.items():
+            status, result = _process_gene(args)
+            if status == "success":
+                successful_results.append(result)
+            else:
+                error_results.append(result)
+            if use_checkpoint:
+                _save_checkpoint(
+                    CHECKPOINT_FILE, cache_key, successful_results, error_results
+                )
 
     return successful_results, error_results
 
@@ -219,7 +389,7 @@ def write_validation_report(validation_failures):
 
 
 def generate_summary(
-    total_genes, parsing_time, execution_time, errors_summary, validation_failures
+    total_genes, total_time, errors_summary, validation_failures
 ):
     """
     Generates a streamlined summary report categorizing validation failures by checker.
@@ -252,8 +422,7 @@ def generate_summary(
     # Generate the summary report
     with open("summary_report.txt", "w") as f:
         f.write(f"Total genes processed: {total_genes}\n")
-        f.write(f"Parsing runtime: {parsing_time:.2f} seconds\n")
-        f.write(f"Execution runtime: {execution_time:.2f} seconds\n")
+        f.write(f"Total wall-clock runtime: {total_time:.2f} seconds\n")
         f.write(f"Total exceptions: {sum(errors_summary.values())}\n")
 
         if errors_summary:
@@ -273,24 +442,22 @@ def generate_summary(
             f.write(f"- {checker}: {count} occurrences\n")
 
 
-def _run_benchmark(fasta_file, gene_filter=None):
+def _run_benchmark(fasta_file, gene_filter=None, use_mp=False):
     """
     Runs the complete benchmark process: parsing, running TranscriptDesigner, validating, and generating reports.
     """
     start_time = time.time()
 
     # Benchmark the proteome
-    parsing_start = time.time()
-    successful_results, error_results = benchmark_proteome(fasta_file, gene_filter)
-    parsing_time = time.time() - parsing_start
+    successful_results, error_results = benchmark_proteome(fasta_file, gene_filter, use_mp)
 
     # Analyze and log errors
     errors_summary = analyze_errors(error_results)
 
     # Validate the successful transcripts
-    validation_start = time.time()
     validation_failures = validate_transcripts(successful_results)
-    execution_time = time.time() - validation_start
+
+    total_time = time.time() - start_time
 
     # Write validation and error reports
     write_validation_report(validation_failures)
@@ -298,12 +465,17 @@ def _run_benchmark(fasta_file, gene_filter=None):
     # Generate the summary report
     total_genes = len(successful_results) + len(error_results)
     generate_summary(
-        total_genes, parsing_time, execution_time, errors_summary, validation_failures
+        total_genes, total_time, errors_summary, validation_failures
     )
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Proteome benchmark for TranscriptDesigner")
+    parser.add_argument("gene_filter", nargs="?", default=None, help="Run only this gene (by name)")
+    parser.add_argument("--mp", action="store_true", help="Enable multiprocessing (logging auto-disabled)")
+    args = parser.parse_args()
+
     fasta_file = "tests/benchmarking/uniprotkb_proteome_UP000054015_2024_09_24.fasta"
-    gene_filter = sys.argv[1] if len(sys.argv) > 1 else None
-    _run_benchmark(fasta_file, gene_filter)
+    _run_benchmark(fasta_file, args.gene_filter, use_mp=args.mp)

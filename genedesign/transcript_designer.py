@@ -14,13 +14,18 @@ from genedesign.checkers.internal_rbs_checker import InternalRBSChecker
 from genedesign.models.transcript import Transcript
 from genedesign.rbs_chooser import RBSChooser
 
+# Bump this string when algorithm changes would invalidate cached benchmark results.
+# Leave it unchanged for tuning-only edits (e.g. max iterations, retry counts).
+CACHE_VERSION = "2"
 
 
 def _setup_logger() -> logging.Logger:
     """Creates a file logger writing to logs/<YYYY-MM-DD_HH-MM-SS>.log."""
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{os.getpid()}.log"
+    log_path = (
+        log_dir / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{os.getpid()}.log"
+    )
 
     logger = logging.getLogger(f"transcript_designer_{os.getpid()}")
     logger.setLevel(logging.DEBUG)
@@ -112,7 +117,7 @@ class TranscriptDesigner:
         """
         WINDOW = 3  # 3 codons (9 bp) per step
         DOWNSTREAM = 6  # 6 codons (18 bp) of random downstream context
-        MAX_RESTARTS = 500
+        MAX_RESTARTS = 50
         # Minimum context so hairpin chunks (50 bp) always fit; extra
         # context lets the scorer catch hairpins between distant positions.
         MIN_CONTEXT = 100
@@ -136,6 +141,12 @@ class TranscriptDesigner:
         consecutive_same_hairpin = 0
         last_hairpin_sig = None
         EARLY_STOP = 15  # give up if same hairpin pattern repeats this many times
+
+        # Fail-fast: track how many checks pass each restart.  If we haven't
+        # improved in PATIENCE restarts, the gene is likely intractable — bail.
+        best_checks_passed = 0
+        restarts_since_improvement = 0
+        PATIENCE = 30
 
         for restart_idx in range(MAX_RESTARTS):
             self.log.info("--- Restart %d/%d ---", restart_idx + 1, MAX_RESTARTS)
@@ -172,6 +183,7 @@ class TranscriptDesigner:
 
                 scored: list[tuple[tuple, float]] = []
                 preamble_tail = preamble[-15:] if len(preamble) >= 15 else preamble
+                locked_set = set(locked)
                 for combo in self._enumerate_codon_combos(amino_window):
                     combo_seq = "".join(combo)
                     # Cheap pre-filter: skip combos that create 2+ hairpins
@@ -180,7 +192,9 @@ class TranscriptDesigner:
                         scored.append((combo, float("-inf")))
                         continue
                     check_seq = preamble + combo_seq + downstream
-                    score = self._score_window(check_seq, combo, len(preamble))
+                    score = self._score_window(
+                        check_seq, combo, len(preamble), locked_set
+                    )
                     scored.append((combo, score))
 
                 best_score = max(s for _, s in scored)
@@ -189,10 +203,7 @@ class TranscriptDesigner:
                 # If the actual best is significantly below this, a penalty
                 # was applied — backtrack to escape.
                 best_codon_only = max(
-                    sum(
-                        math.log(self.codonToWeight.get(c, 1e-9) + 1e-9)
-                        for c in combo
-                    )
+                    sum(math.log(self.codonToWeight.get(c, 1e-9) + 1e-9) for c in combo)
                     for combo, _ in scored
                 )
                 has_penalties = best_score < best_codon_only - 10.0
@@ -224,6 +235,7 @@ class TranscriptDesigner:
 
                     scored = []
                     preamble_tail = preamble[-15:] if len(preamble) >= 15 else preamble
+                    locked_set = set(locked)
                     for combo in self._enumerate_codon_combos(amino_window):
                         combo_seq = "".join(combo)
                         if self._boundary_hairpin_count(preamble_tail, combo_seq) >= 2:
@@ -231,7 +243,7 @@ class TranscriptDesigner:
                             continue
                         check_seq = preamble + combo_seq + downstream
                         score = self._score_window(
-                            check_seq, combo, len(preamble)
+                            check_seq, combo, len(preamble), locked_set
                         )
                         scored.append((combo, score))
 
@@ -242,9 +254,7 @@ class TranscriptDesigner:
                     chosen = max(scored, key=lambda x: x[1])[0]
                 else:
                     near_best = [
-                        c
-                        for c, s in scored
-                        if s >= best_score - NEAR_BEST_MARGIN
+                        c for c, s in scored if s >= best_score - NEAR_BEST_MARGIN
                     ]
                     chosen = random.choice(near_best)
 
@@ -307,12 +317,37 @@ class TranscriptDesigner:
                 passed_rbs,
             )
 
-            if passed_promoter and passed_hairpin and passed_forbidden and passed_rbs:
+            checks_passed = sum(
+                [
+                    passed_promoter,
+                    passed_hairpin,
+                    passed_forbidden,
+                    passed_rbs,
+                ]
+            )
+
+            if checks_passed > best_checks_passed:
+                best_checks_passed = checks_passed
+                restarts_since_improvement = 0
+            else:
+                restarts_since_improvement += 1
+
+            if checks_passed == 4:
                 self.log.info(
                     "SUCCESS | restarts_used=%d",
                     restart_idx + 1,
                 )
                 return Transcript(selected_rbs, peptide, locked)
+
+            # Fail-fast: no improvement in PATIENCE restarts → bail.
+            if restarts_since_improvement >= PATIENCE:
+                self.log.warning(
+                    "EARLY STOP after %d restarts — stuck at %d/4 checks for %d restarts",
+                    restart_idx + 1,
+                    best_checks_passed,
+                    PATIENCE,
+                )
+                break
 
             # Early stop: if the same hairpin signature repeats, the region
             # is likely inherently unfixable (e.g. repeated ATG-only codons).
@@ -332,7 +367,11 @@ class TranscriptDesigner:
                 )
                 break
 
-            self.log.info("  Final checks failed — restarting.")
+            self.log.info(
+                "  %d/4 checks passed (best=%d) — restarting.",
+                checks_passed,
+                best_checks_passed,
+            )
 
         self.log.error(
             "FAILED | exhausted %d restarts for peptide=%s...",
@@ -360,18 +399,28 @@ class TranscriptDesigner:
         ]
         yield from product(*options)
 
-    def _score_window(self, check_seq: str, combo: tuple, window_offset: int) -> float:
+    def _score_window(
+        self,
+        check_seq: str,
+        combo: tuple,
+        window_offset: int,
+        locked_codons: set | None = None,
+    ) -> float:
         """
         Scores *combo* in context.  Forbidden sequences → -inf.
-        Hairpins and promoters → large penalties.  Otherwise codon weight sum.
+        Hairpins and promoters → soft penalties.  Rare codons penalised.
+        Novel codons (not yet in locked_codons) get a small diversity bonus.
         """
         from genedesign.seq_utils.hairpin_counter import hairpin_counter
         from genedesign.seq_utils.reverse_complement import reverse_complement
 
         window_end = window_offset + len(combo) * 3
         CHUNK, STEP = 50, 25
-        HAIRPIN_PENALTY = 200.0
-        PROMOTER_PENALTY = 200.0
+        HAIRPIN_PENALTY = 30.0
+        PROMOTER_PENALTY = 30.0
+        RARE_THRESHOLD = 0.1
+        RARE_PENALTY = 5.0
+        DIVERSITY_BONUS = 0.5
         PROMOTER_FRAME = 29
         PROMOTER_THRESHOLD = 9.134
 
@@ -435,10 +484,16 @@ class TranscriptDesigner:
         codon_score = sum(
             math.log(self.codonToWeight.get(codon, 1e-9) + 1e-9) for codon in combo
         )
+        rare_count = sum(
+            1 for c in combo if self.codonToWeight.get(c, 0) < RARE_THRESHOLD
+        )
+        novel = sum(1 for c in combo if c not in locked_codons) if locked_codons else 0
         return (
             codon_score
             - HAIRPIN_PENALTY * hairpin_violations
             - PROMOTER_PENALTY * promoter_violations
+            - RARE_PENALTY * rare_count
+            + DIVERSITY_BONUS * novel
         )
 
     def _repair_hairpins(
@@ -457,12 +512,18 @@ class TranscriptDesigner:
         CHUNK, STEP = 50, 25
         utr_len = len(utr)
         tried: set[tuple[int, str]] = set()  # (codon_idx, codon) already used
-        codon_touch_count: dict[int, int] = {}  # how many times each codon idx was swapped
+        codon_touch_count: dict[
+            int, int
+        ] = {}  # how many times each codon idx was swapped
 
         def _local_hairpin_count(seq: str, region_start: int, region_end: int) -> int:
             """Count hairpin violations in all 50bp chunks overlapping a region."""
             total = 0
-            for cs in range(max(0, region_start - CHUNK + 1), min(len(seq) - CHUNK + 1, region_end), STEP):
+            for cs in range(
+                max(0, region_start - CHUNK + 1),
+                min(len(seq) - CHUNK + 1, region_end),
+                STEP,
+            ):
                 count, _ = hairpin_counter(seq[cs : cs + CHUNK], 3, 4, 9)
                 if count > 1:
                     total += count - 1
@@ -498,9 +559,7 @@ class TranscriptDesigner:
                 break
 
             # Log failing chunk positions for visibility.
-            failing_positions = sorted(
-                {s for pair in hairpin_stems for s in pair}
-            )
+            failing_positions = sorted({s for pair in hairpin_stems for s in pair})
             self.log.info(
                 "    Repair pass %d: %d hairpin stems at seq positions %s",
                 pass_idx + 1,
@@ -556,7 +615,9 @@ class TranscriptDesigner:
                         if still_hairpin:
                             continue
                         # Check that this swap doesn't increase local hairpins.
-                        new_local = _local_hairpin_count(trial_full, region_start, region_end)
+                        new_local = _local_hairpin_count(
+                            trial_full, region_start, region_end
+                        )
                         if new_local > best_local:
                             continue
                         if new_local < best_local or weight > best_weight:
@@ -568,7 +629,9 @@ class TranscriptDesigner:
                     tried.add((best_fix[0], best_fix[1]))
                     tried.add((best_fix[0], locked[best_fix[0]]))  # mark old codon too
                     locked[best_fix[0]] = best_fix[1]
-                    codon_touch_count[best_fix[0]] = codon_touch_count.get(best_fix[0], 0) + 1
+                    codon_touch_count[best_fix[0]] = (
+                        codon_touch_count.get(best_fix[0], 0) + 1
+                    )
                     touches = codon_touch_count[best_fix[0]]
                     self.log.info(
                         "      swap codon %d %s→%s (w=%.3f, local %d→%d, touches=%d)",
@@ -662,7 +725,7 @@ class TranscriptDesigner:
             )[:5]
             self.log.info(
                 "    Repair summary: %d passes, %d codons touched, top=%s",
-                pass_idx + 1 if 'pass_idx' in dir() else 0,
+                pass_idx + 1 if "pass_idx" in dir() else 0,
                 len(codon_touch_count),
                 [(idx, peptide[idx], cnt) for idx, cnt in top_touched],
             )
@@ -694,7 +757,11 @@ class TranscriptDesigner:
                 if j + 3 <= combo_start and i + 3 <= combo_start:
                     continue
                 s2 = combined[j : j + 3]
-                if s1[0] == _RC.get(s2[2]) and s1[1] == _RC.get(s2[1]) and s1[2] == _RC.get(s2[0]):
+                if (
+                    s1[0] == _RC.get(s2[2])
+                    and s1[1] == _RC.get(s2[1])
+                    and s1[2] == _RC.get(s2[0])
+                ):
                     count += 1
         return count
 
