@@ -46,8 +46,51 @@ def _setup_logger() -> logging.Logger:
 
 class TranscriptDesigner:
     """
-    Reverse translates a protein sequence into a DNA sequence and selects an
-    RBS using the Sliding Window Method.
+    Reverse translates a protein sequence into an optimised CDS and selects a
+    ribosome binding site (RBS).
+
+    Algorithm overview
+    ------------------
+    Assembly (sliding window):
+        The protein is translated codon-by-codon in 3-codon (9 bp) windows.
+        For each window, every synonymous codon combination (~216 max) is scored
+        in context — the 100 bp prefix already assembled plus 18 bp of randomly
+        sampled downstream context.  The best-scoring combination is locked in
+        before the window advances.
+
+    Scoring (_score_window):
+        Each combination receives a composite score:
+          + log-sum of codon usage weights (maximise CAI)
+          + 0.5 per codon not already seen in the locked sequence (diversity)
+          − 5.0 per rare codon (usage frequency < 0.1, matching CodonChecker)
+          − 30 per hairpin violation in overlapping 50 bp chunks
+          − 30 per internal promoter hit (PWM score ≥ 9.134)
+          − inf for any forbidden restriction site (hard reject)
+
+        The structural penalties (30) are intentionally modest so that codon
+        quality (CAI, diversity, rare-codon avoidance) remains influential even
+        in structurally constrained regions.  Hairpin violations are a soft
+        signal here; the full hairpin_checker and a targeted repair pass run
+        afterwards on the complete CDS.
+
+    Backtracking:
+        If the best-scoring window is significantly below its theoretical
+        codon-only score, a hairpin or promoter penalty dominated — the
+        previous 2 codons are removed and the window is widened to escape
+        the local constraint.
+
+    Post-assembly repair (_repair_hairpins):
+        After assembly, a targeted repair loop identifies hairpin stems and
+        greedily swaps single synonymous codons to break them, re-checking
+        after each swap to avoid introducing new problems.  A 2-codon fallback
+        handles stems whose bases are split across codons.
+
+    Final validation:
+        The assembled CDS + chosen RBS is validated against four hard checkers
+        (internal promoter, hairpin, forbidden sequences, internal RBS).  If
+        any fail the whole sequence is discarded and assembly restarts with a
+        fresh random seed continuation.  Two early-stop heuristics prevent
+        wasting restarts on intractable genes.
     """
 
     def __init__(self):
@@ -96,28 +139,21 @@ class TranscriptDesigner:
 
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
-        Builds the CDS left-to-right using a greedy sliding window.
+        Assemble and validate a CDS for *peptide*, then attach an RBS.
 
-        For each 3-codon (9 bp) window:
-          1. Enumerate all synonymous codon combinations (~216 max).
-          2. Score each in context: preamble (9 bp already locked) +
-             window (9 bp being optimised) + downstream (18 bp random).
-             Forbidden sequences are hard-rejected; hairpins and promoters
-             are soft-penalised.
-          3. Pick the best-scoring combo (greedy) and lock it.
-
-        Restarts vary because downstream context is randomly sampled each time.
+        Raises RuntimeError if no valid transcript is found within MAX_RESTARTS.
 
         Parameters:
-            peptide  (str): Protein sequence to reverse-translate.
-            ignores  (set): RBS options to exclude.
+            peptide  (str): Protein sequence to reverse-translate (single-letter AA codes).
+            ignores  (set): RBS options to exclude (e.g. already used in the same operon).
 
         Returns:
-            Transcript: Validated transcript with RBS and codon list.
+            Transcript: Validated transcript containing the selected RBS,
+                        original peptide, and the locked codon list (including stop).
         """
         WINDOW = 3  # 3 codons (9 bp) per step
         DOWNSTREAM = 6  # 6 codons (18 bp) of random downstream context
-        MAX_RESTARTS = 50
+        MAX_RESTARTS = 150
         # Minimum context so hairpin chunks (50 bp) always fit; extra
         # context lets the scorer catch hairpins between distant positions.
         MIN_CONTEXT = 100
@@ -140,10 +176,15 @@ class TranscriptDesigner:
 
         consecutive_same_hairpin = 0
         last_hairpin_sig = None
-        EARLY_STOP = 15  # give up if same hairpin pattern repeats this many times
+        # If the same hairpin stem repeats EARLY_STOP times, the local sequence
+        # context (e.g. a run of Met codons forced to ATG) is structurally
+        # intractable — no amount of resampling will fix it.
+        EARLY_STOP = 15
 
-        # Fail-fast: track how many checks pass each restart.  If we haven't
-        # improved in PATIENCE restarts, the gene is likely intractable — bail.
+        # If the number of passing checks hasn't improved after PATIENCE restarts,
+        # the gene is likely hitting a hard constraint and further attempts would
+        # waste time.  PATIENCE is deliberately generous to allow recovery from
+        # temporarily bad random downstream context.
         best_checks_passed = 0
         restarts_since_improvement = 0
         PATIENCE = 30
@@ -275,7 +316,12 @@ class TranscriptDesigner:
             else:
                 self.log.info("  Hairpin repair: could not fix all hairpins")
 
-            # ── Codon quality check (logged, not gated) ──────────────────
+            # ── Codon quality (diagnostic only — not a restart gate) ─────
+            # CodonChecker's diversity metric (unique_codons / total_codons)
+            # cannot reach its 0.5 threshold for proteins longer than ~128 aa,
+            # since there are only 61 sense codons.  We log it for visibility
+            # but rely on the scoring penalties to improve CAI and rare-codon
+            # usage during assembly rather than hard-gating here.
             codons_above_board, diversity, rare_count, cai = self.codonChecker.run(
                 locked
             )
@@ -511,10 +557,9 @@ class TranscriptDesigner:
         _RC = {"A": "T", "T": "A", "C": "G", "G": "C"}
         CHUNK, STEP = 50, 25
         utr_len = len(utr)
-        tried: set[tuple[int, str]] = set()  # (codon_idx, codon) already used
-        codon_touch_count: dict[
-            int, int
-        ] = {}  # how many times each codon idx was swapped
+        tried: set[tuple[int, str]] = set()  # (codon_idx, codon) already attempted
+        codon_touch_count: dict[int, int] = {}  # swap count per codon index
+        passes_run = 0  # actual number of repair passes executed
 
         def _local_hairpin_count(seq: str, region_start: int, region_end: int) -> int:
             """Count hairpin violations in all 50bp chunks overlapping a region."""
@@ -530,6 +575,7 @@ class TranscriptDesigner:
             return total
 
         for pass_idx in range(max_passes):
+            passes_run = pass_idx + 1
             cds = "".join(locked) + "TAA"
             full_seq = utr + cds
 
@@ -718,14 +764,14 @@ class TranscriptDesigner:
                 if not fixed_any:
                     break
 
-        # Summary of repair activity.
+        # Log a summary of which codons were swapped most often.
         if codon_touch_count:
             top_touched = sorted(
                 codon_touch_count.items(), key=lambda x: x[1], reverse=True
             )[:5]
             self.log.info(
                 "    Repair summary: %d passes, %d codons touched, top=%s",
-                pass_idx + 1 if "pass_idx" in dir() else 0,
+                passes_run,
                 len(codon_touch_count),
                 [(idx, peptide[idx], cnt) for idx, cnt in top_touched],
             )
